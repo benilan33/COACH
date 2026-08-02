@@ -1,51 +1,30 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { supabase } from "./supabaseClient";
 
 const COLORS = ["#7C6DFA","#34D399","#F87171","#FBBF24","#60A5FA","#F472B6","#A78BFA","#FB923C","#2DD4BF"];
 
-const INITIAL_SUBJECTS = [
-  { id:1, name:"Anglais LV1", coef:3, grades:[{v:16.5,w:2,label:""},{v:13,w:1,label:""}], obj:null, color:COLORS[0] },
-  { id:2, name:"Espagnol LV2", coef:3, grades:[{v:17.5,w:0.5,label:""}], obj:null, color:COLORS[1] },
-  { id:3, name:"Français", coef:3, grades:[{v:9,w:2,label:""}], obj:null, color:COLORS[2] },
-  { id:4, name:"Histoire-Géo", coef:3, grades:[
-    {v:15,w:0.5,label:""},{v:13,w:0.5,label:""},{v:11,w:1.5,label:""},{v:13,w:1,label:""}
-  ], obj:null, color:COLORS[3] },
-  { id:5, name:"SVT tronc commun", coef:1, grades:[{v:16,w:2,label:""}], obj:null, color:COLORS[4] },
-  { id:6, name:"Physique-Chimie", coef:1, grades:[
-    {v:15.6,w:1,label:"19.5/25"},{v:9.5,w:0.25,label:"4.75/10"},{v:16,w:2.5,label:""}
-  ], obj:null, color:COLORS[5] },
-  { id:7, name:"Mathématiques", coef:4, grades:[{v:18.5,w:0.1,label:""},{v:14.75,w:1,label:""},{v:19,w:1,label:""}], obj:null, color:COLORS[6] },
-  { id:8, name:"NSI", coef:4, grades:[{v:19.5,w:1.5,label:""}], obj:null, color:COLORS[7] },
-  { id:9, name:"SVT spécialité", coef:4, grades:[{v:5,w:1,label:"2.5/10"},{v:15.71,w:0.5,label:"11/14"}], obj:null, color:COLORS[8] },
-];
+const SLOTS = ["8h-9h","9h-10h","10h-11h","11h-12h","12h-13h","13h-14h","14h-15h","15h-16h","16h-17h","17h-18h"];
+const DAYS = ["Lun","Mar","Mer","Jeu","Ven","Sam"];
 
 function calcAvg(grades) {
-  if (!grades.length) return null;
+  if (!grades || !grades.length) return null;
   const tot = grades.reduce((s,g)=>s+g.v*g.w,0);
   const w = grades.reduce((s,g)=>s+g.w,0);
   return tot/w;
 }
-
 function genAvg(subjects) {
   let tot=0,w=0;
   subjects.forEach(s=>{ const a=calcAvg(s.grades); if(a!==null){tot+=a*s.coef;w+=s.coef;} });
   return w?tot/w:null;
 }
-
 function sc(avg, obj) {
   if(avg===null) return "#6B6B85";
-  if(obj===null) return "#7C6DFA";
+  if(obj===null||obj===undefined) return "#7C6DFA";
   if(avg>=obj) return "#34D399";
   if(avg>=obj-2) return "#FBBF24";
   return "#F87171";
 }
-
-const S = { bg:"#0C0C10",surface:"#13131A",surface2:"#1C1C28",border:"#252535",text:"#F0EFF8",muted:"#6B6B85",accent:"#7C6DFA" };
-
-function inp(extra={}) {
-  return { background:S.bg,border:`1px solid ${S.border}`,color:S.text,borderRadius:8,padding:"8px 10px",fontFamily:"'DM Mono',monospace",fontSize:13,outline:"none",...extra };
-}
-
-// Simulate avg if subject has objective
 function simAvgWithObj(subjects, subId, objVal) {
   let tot=0,w=0;
   subjects.forEach(s=>{
@@ -55,102 +34,245 @@ function simAvgWithObj(subjects, subId, objVal) {
   });
   return w?tot/w:null;
 }
-
-// What grade needed in 1 note of given weight to reach obj
 function gradeNeeded(grades, obj, noteWeight) {
   const curTot = grades.reduce((s,g)=>s+g.v*g.w,0);
   const curW = grades.reduce((s,g)=>s+g.w,0);
   return (obj*(curW+noteWeight)-curTot)/noteWeight;
 }
 
+const S = { bg:"#0C0C10",surface:"#13131A",surface2:"#1C1C28",border:"#252535",text:"#F0EFF8",muted:"#6B6B85",accent:"#7C6DFA" };
+
+function inp(extra={}) {
+  return { background:S.bg,border:`1px solid ${S.border}`,color:S.text,borderRadius:8,padding:"8px 10px",fontFamily:"'DM Mono',monospace",fontSize:13,outline:"none",...extra };
+}
+
+function buildEvolutionData(subjects, granularity) {
+  const allGrades = [];
+  subjects.forEach(s=>{
+    (s.grades||[]).forEach(g=>allGrades.push({...g, subjectId:s.id, coef:s.coef, color:s.color, subjectName:s.name}));
+  });
+  allGrades.sort((a,b)=>new Date(a.date)-new Date(b.date));
+  if(!allGrades.length) return [];
+
+  const points = [];
+  const runningGradesBySubject = {};
+  subjects.forEach(s=>runningGradesBySubject[s.id]=[]);
+
+  allGrades.forEach(g=>{
+    runningGradesBySubject[g.subjectId].push(g);
+    let tot=0,w=0;
+    subjects.forEach(s=>{
+      const a = calcAvg(runningGradesBySubject[s.id]);
+      if(a!==null){tot+=a*s.coef;w+=s.coef;}
+    });
+    const avg = w?tot/w:null;
+    const d = new Date(g.date);
+    let label;
+    if(granularity==="mois") label = d.toLocaleDateString("fr-FR",{month:"short",year:"2-digit"});
+    else if(granularity==="trimestre") {
+      const month = d.getMonth();
+      const trim = month<=9&&month>=8?"T1":month<=11||month<=1?"T2":"T3";
+      label = `${trim} ${d.getFullYear()}`;
+    } else label = d.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"});
+    points.push({ label, avg: avg!==null?parseFloat(avg.toFixed(2)):null, date:g.date });
+  });
+  return points;
+}
+
 export default function App() {
-  const [subjects, setSubjects] = useState(INITIAL_SUBJECTS);
+  const [subjects, setSubjects] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [target, setTarget] = useState(15);
   const [tab, setTab] = useState("dashboard");
   const [selectedId, setSelectedId] = useState(null);
   const [newGrade, setNewGrade] = useState({v:"",w:"1",label:""});
   const [newSubName, setNewSubName] = useState("");
   const [newSubCoef, setNewSubCoef] = useState("1");
+  const [simCoef, setSimCoef] = useState({});
+  const [granularity, setGranularity] = useState("mois");
+  const [evoSubject, setEvoSubject] = useState("global");
+  const [tasks, setTasks] = useState([]);
+  const [newTask, setNewTask] = useState("");
+  const [schedule, setSchedule] = useState({});
+  const [persoTab, setPersoTab] = useState("dossiers");
   const [folders, setFolders] = useState([]);
   const [newFolderName, setNewFolderName] = useState("");
   const [selectedFolder, setSelectedFolder] = useState(null);
-  const [chatHistory, setChatHistory] = useState([]);
-  const [chatInput, setChatInput] = useState("");
-  const [chatLoading, setChatLoading] = useState(false);
-  const [objInput, setObjInput] = useState({});
-  const [simCoef, setSimCoef] = useState({});
-  const chatEndRef = useRef(null);
-  const fileInputRef = useRef(null);
+
+  // ---- Chargement initial depuis Supabase ----
+  useEffect(() => {
+    async function fetchAll() {
+      const { data: subjectsData, error: e1 } = await supabase.from('subjects').select('*').order('id');
+      if (e1) console.error('subjects:', e1); else setSubjects(subjectsData || []);
+
+      const { data: tasksData, error: e2 } = await supabase.from('tasks').select('*').order('id');
+      if (e2) console.error('tasks:', e2); else setTasks(tasksData || []);
+
+      const { data: foldersData, error: e3 } = await supabase.from('folders').select('*').order('id');
+      const { data: filesData, error: e4 } = await supabase.from('files').select('*').order('id');
+      if (e3) console.error('folders:', e3);
+      if (e4) console.error('files:', e4);
+      if (foldersData) {
+        setFolders(foldersData.map(f => ({
+          ...f,
+          files: (filesData || []).filter(file => file.folder_id === f.id)
+        })));
+      }
+
+      const { data: scheduleData, error: e5 } = await supabase.from('schedule').select('*');
+      if (e5) console.error('schedule:', e5);
+      else {
+        const map = {};
+        (scheduleData || []).forEach(row => { map[`${row.day}_${row.slot}`] = row.content; });
+        setSchedule(map);
+      }
+
+      setLoading(false);
+    }
+    fetchAll();
+  }, []);
 
   const avg = genAvg(subjects);
   const avgColor = avg===null?S.muted:avg>=target?"#34D399":avg>=target-1?"#FBBF24":"#F87171";
   const pct = avg!==null?Math.min(100,(avg/target)*100):0;
   const selected = subjects.find(s=>s.id===selectedId);
 
-  function updSub(id,patch){ setSubjects(p=>p.map(s=>s.id===id?{...s,...patch}:s)); }
-  function addGrade(){
-    const v=parseFloat(newGrade.v),w=parseFloat(newGrade.w)||1;
-    if(isNaN(v)||v<0||v>20||!selectedId) return;
-    updSub(selectedId,{grades:[...selected.grades,{v,w,label:newGrade.label}]});
+  // ---- Matières / notes ----
+  async function updSub(id, patch) {
+    setSubjects(p => p.map(s => s.id === id ? {...s, ...patch} : s));
+    const { error } = await supabase.from('subjects').update(patch).eq('id', id);
+    if (error) console.error('updSub:', error);
+  }
+
+  async function addGrade() {
+    const v = parseFloat(newGrade.v), w = parseFloat(newGrade.w) || 1;
+    if (isNaN(v) || v < 0 || v > 20 || !selectedId) return;
+    const newGrades = [...(selected.grades||[]), {v, w, label:newGrade.label, date:new Date().toISOString().slice(0,10)}];
+    await updSub(selectedId, {grades:newGrades});
     setNewGrade({v:"",w:"1",label:""});
   }
-  function addSubject(){
-    const name=newSubName.trim(),coef=parseFloat(newSubCoef)||1;
-    if(!name) return;
-    setSubjects(p=>[...p,{id:Date.now(),name,coef,grades:[],obj:null,color:COLORS[p.length%COLORS.length]}]);
-    setNewSubName("");setNewSubCoef("1");
+
+  async function deleteGrade(index) {
+    const newGrades = selected.grades.filter((_,j)=>j!==index);
+    await updSub(selected.id, {grades:newGrades});
   }
 
-  // Objective system
-  function setObj(id, val) {
-    const v = val===""?null:parseFloat(val);
-    updSub(id,{obj:isNaN(v)?null:v});
+  async function addSubject() {
+    const name = newSubName.trim(), coef = parseFloat(newSubCoef) || 1;
+    if (!name) return;
+    const color = COLORS[subjects.length % COLORS.length];
+    const { data, error } = await supabase.from('subjects')
+      .insert({name, coef, grades:[], obj:null, color})
+      .select().single();
+    if (error) { console.error('addSubject:', error); return; }
+    setSubjects(p => [...p, data]);
+    setNewSubName(""); setNewSubCoef("1");
   }
 
-  // Folder file upload
-  function handleFileUpload(folderId, files) {
-    const updated = [...folders];
-    const fi = updated.findIndex(f=>f.id===folderId);
-    if(fi===-1) return;
-    Array.from(files).forEach(file=>{
-      updated[fi].files.push({name:file.name,size:file.size,type:file.type,date:new Date().toLocaleDateString("fr-FR")});
-    });
-    setFolders(updated);
+  async function deleteSubject(id) {
+    setSubjects(p => p.filter(x => x.id !== id));
+    setSelectedId(null);
+    const { error } = await supabase.from('subjects').delete().eq('id', id);
+    if (error) console.error('deleteSubject:', error);
   }
 
-  function addFolder(){
-    if(!newFolderName.trim()) return;
-    setFolders(p=>[...p,{id:Date.now(),name:newFolderName.trim(),files:[]}]);
+  async function setObj(id, val) {
+    const v = val === "" ? null : parseFloat(val);
+    await updSub(id, {obj: isNaN(v) ? null : v});
+  }
+
+  // ---- Tâches ----
+  async function addTask() {
+    if (!newTask.trim()) return;
+    const { data, error } = await supabase.from('tasks')
+      .insert({text:newTask.trim(), done:false, alarm:null})
+      .select().single();
+    if (error) { console.error('addTask:', error); return; }
+    setTasks(p => [...p, data]);
+    setNewTask("");
+  }
+
+  async function toggleTask(id) {
+    const t = tasks.find(x=>x.id===id);
+    setTasks(p => p.map(x => x.id===id ? {...x, done:!x.done} : x));
+    const { error } = await supabase.from('tasks').update({done: !t.done}).eq('id', id);
+    if (error) console.error('toggleTask:', error);
+  }
+
+  async function deleteTask(id) {
+    setTasks(p => p.filter(t => t.id !== id));
+    const { error } = await supabase.from('tasks').delete().eq('id', id);
+    if (error) console.error('deleteTask:', error);
+  }
+
+  async function setTaskAlarm(id, value) {
+    setTasks(p => p.map(t => t.id===id ? {...t, alarm:value} : t));
+    const { error } = await supabase.from('tasks').update({alarm: value || null}).eq('id', id);
+    if (error) console.error('setTaskAlarm:', error);
+  }
+
+  // ---- Emploi du temps ----
+  async function setScheduleSlot(day, slot, value) {
+    setSchedule(p => ({...p, [`${day}_${slot}`]: value}));
+    const { error } = await supabase.from('schedule')
+      .upsert({day, slot, content:value}, {onConflict:'day,slot'});
+    if (error) console.error('setScheduleSlot:', error);
+  }
+
+  // ---- Dossiers / fichiers ----
+  async function addFolder() {
+    if (!newFolderName.trim()) return;
+    const { data, error } = await supabase.from('folders')
+      .insert({name:newFolderName.trim()})
+      .select().single();
+    if (error) { console.error('addFolder:', error); return; }
+    setFolders(p => [...p, {...data, files:[]}]);
     setNewFolderName("");
   }
 
-  async function sendChat(){
-    if(chatLoading||!chatInput.trim()) return;
-    const msg=chatInput.trim(); setChatInput("");
-    const newHist=[...chatHistory,{role:"user",content:msg}];
-    setChatHistory(newHist); setChatLoading(true);
-    const subCtx=JSON.stringify(subjects.map(s=>({id:s.id,name:s.name,coef:s.coef,avg:calcAvg(s.grades)?.toFixed(2)||"aucune",grades:s.grades.map(g=>`${g.v}/20 coef${g.w}`).join(", "),objectif:s.obj})));
-    const system=`Tu es le coach scolaire d'Ilan, Première Générale, spécialités Maths/NSI. Moyenne: ${avg?.toFixed(2)||"?"}\/20, objectif: ${target}/20.\nMatières: ${subCtx}\nSi ajout note: <ACTION>{"type":"add_grade","subjectName":"...","value":X,"weight":X}</ACTION>\nSi modif objectif: <ACTION>{"type":"set_obj","subjectName":"...","value":X}</ACTION>\nFrançais, ton décontracté, max 3-4 lignes.`;
-    try {
-      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:800,system,messages:newHist.map(m=>({role:m.role,content:m.content}))})});
-      const data=await res.json();
-      let reply=data.content?.[0]?.text||"Erreur.";
-      const match=reply.match(/<ACTION>(.*?)<\/ACTION>/s);
-      const clean=reply.replace(/<ACTION>.*?<\/ACTION>/s,"").trim();
-      if(match){try{applyAction(JSON.parse(match[1]));}catch(e){}}
-      setChatHistory(h=>[...h,{role:"assistant",content:clean+(match?"\n✅ Modification appliquée !":"")}]);
-    } catch(e){ setChatHistory(h=>[...h,{role:"assistant",content:"Erreur connexion."}]); }
-    setChatLoading(false);
-    setTimeout(()=>chatEndRef.current?.scrollIntoView({behavior:"smooth"}),50);
+  async function deleteFolder(id) {
+    setFolders(p => p.filter(f => f.id !== id));
+    if (selectedFolder === id) setSelectedFolder(null);
+    const { error } = await supabase.from('folders').delete().eq('id', id);
+    if (error) console.error('deleteFolder:', error);
   }
 
-  function applyAction(action){
-    if(action.type==="add_grade") setSubjects(p=>p.map(s=>s.name.toLowerCase().includes(action.subjectName.toLowerCase())?{...s,grades:[...s.grades,{v:action.value,w:action.weight||1,label:""}]}:s));
-    else if(action.type==="set_obj") setSubjects(p=>p.map(s=>s.name.toLowerCase().includes(action.subjectName.toLowerCase())?{...s,obj:action.value}:s));
+  async function handleFileUpload(folderId, fileList) {
+    const rows = Array.from(fileList).map(file => ({
+      folder_id: folderId, name: file.name, size: file.size, type: file.type
+    }));
+    const { data, error } = await supabase.from('files').insert(rows).select();
+    if (error) { console.error('handleFileUpload:', error); return; }
+    setFolders(p => p.map(f => f.id === folderId
+      ? {...f, files:[...f.files, ...data.map(d=>({...d, date:new Date(d.created_at).toLocaleDateString("fr-FR")}))]}
+      : f));
   }
 
-  const TABS=[["dashboard","📊"],["subjects","📚"],["plan","🎯"],["perso","📁"],["chat","🤖"]];
-  const TAB_LABELS={"dashboard":"Dashboard","subjects":"Matières","plan":"Plan","perso":"Perso","chat":"Coach"};
+  async function deleteFile(folderId, fileId) {
+    setFolders(p => p.map(f => f.id === folderId
+      ? {...f, files: f.files.filter(file => file.id !== fileId)}
+      : f));
+    const { error } = await supabase.from('files').delete().eq('id', fileId);
+    if (error) console.error('deleteFile:', error);
+  }
+
+  const evoData = useMemo(()=>{
+    if(evoSubject==="global") return buildEvolutionData(subjects, granularity);
+    const sub = subjects.find(s=>s.id===parseInt(evoSubject));
+    if(!sub) return [];
+    return buildEvolutionData([sub], granularity);
+  }, [subjects, granularity, evoSubject]);
+
+  const TABS=[["dashboard","📊"],["subjects","📚"],["plan","🎯"],["evolution","📈"],["perso","📁"]];
+  const TAB_LABELS={"dashboard":"Dashboard","subjects":"Matières","plan":"Plan","evolution":"Évolution","perso":"Perso"};
+
+  if (loading) {
+    return (
+      <div style={{background:S.bg,color:S.muted,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'DM Mono',monospace"}}>
+        Chargement...
+      </div>
+    );
+  }
 
   return (
     <div style={{background:S.bg,color:S.text,minHeight:"100vh",fontFamily:"'DM Mono',monospace"}}>
@@ -159,13 +281,11 @@ export default function App() {
         *{box-sizing:border-box;margin:0;padding:0}
         ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#252535;border-radius:2px}
         input[type=number]::-webkit-inner-spin-button{opacity:0.3}
-        textarea{resize:none}
       `}</style>
 
-      {/* HEADER — central, big */}
       <div style={{background:"linear-gradient(160deg,#16152A 0%,#0C0C10 100%)",borderBottom:`1px solid ${S.border}`,padding:"28px 20px 20px",textAlign:"center",position:"sticky",top:0,zIndex:100}}>
         <div style={{fontSize:11,color:S.accent,letterSpacing:4,marginBottom:10,fontFamily:"Syne,sans-serif",fontWeight:700}}>
-          PREMIÈRE GÉNÉRALE 5 — TRIMESTRE 3
+          TERMINALE — ANNÉE 2026-2027
         </div>
         <div style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:72,lineHeight:1,color:avgColor,transition:"color 0.4s",letterSpacing:-2}}>
           {avg!==null?avg.toFixed(2):"—"}
@@ -194,8 +314,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* TABS */}
-      <div style={{display:"flex",borderBottom:`1px solid ${S.border}`,background:S.bg,position:"sticky",top:248,zIndex:99}}>
+      <div style={{display:"flex",borderBottom:`1px solid ${S.border}`,background:S.bg,position:"sticky",top:0,zIndex:99}}>
         {TABS.map(([t,icon])=>(
           <button key={t} onClick={()=>setTab(t)} style={{
             flex:1,padding:"11px 2px",background:"none",border:"none",
@@ -216,15 +335,18 @@ export default function App() {
         {tab==="dashboard"&&(
           <div>
             <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>TOUTES LES MATIÈRES</div>
+            {subjects.length===0&&(
+              <div style={{textAlign:"center",padding:"40px 20px",color:S.muted,fontSize:12,fontStyle:"italic"}}>
+                Aucune matière — ajoute-en une dans l'onglet Matières.
+              </div>
+            )}
             {subjects.map(s=>{
               const a=calcAvg(s.grades);
               const color=sc(a,s.obj);
-              const icon=a===null?"":s.obj===null?"":a>=s.obj?"✅":a>=s.obj-2?"⚠️":"🔴";
+              const icon=a===null?"":(s.obj===null||s.obj===undefined)?"":a>=s.obj?"✅":a>=s.obj-2?"⚠️":"🔴";
               return (
                 <div key={s.id} onClick={()=>{setSelectedId(s.id);setTab("subjects");}}
-                  style={{background:S.surface,borderRadius:14,padding:14,marginBottom:10,border:`1px solid ${s.color}18`,cursor:"pointer",transition:"border-color 0.2s"}}
-                  onMouseEnter={e=>e.currentTarget.style.borderColor=s.color+"50"}
-                  onMouseLeave={e=>e.currentTarget.style.borderColor=s.color+"18"}>
+                  style={{background:S.surface,borderRadius:14,padding:14,marginBottom:10,border:`1px solid ${s.color}18`,cursor:"pointer",transition:"border-color 0.2s"}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
                     <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0,flex:1}}>
                       <span style={{fontSize:9,background:S.surface2,color:S.muted,padding:"3px 7px",borderRadius:5,fontFamily:"Syne,sans-serif",fontWeight:700,letterSpacing:1,flexShrink:0}}>COEF {s.coef}</span>
@@ -238,8 +360,8 @@ export default function App() {
                     <div style={{height:"100%",borderRadius:3,width:`${a!==null?(a/20)*100:0}%`,background:`linear-gradient(90deg,${s.color}60,${s.color})`,transition:"width 0.5s"}} />
                   </div>
                   <div style={{display:"flex",justifyContent:"space-between",marginTop:6,fontSize:10,color:S.muted}}>
-                    <span>{s.grades.length} note{s.grades.length!==1?"s":""}</span>
-                    <span>{s.obj!==null?`Objectif ${s.obj}/20 ${icon}`:"Pas d'objectif fixé"}</span>
+                    <span>{(s.grades||[]).length} note{(s.grades||[]).length!==1?"s":""}</span>
+                    <span>{(s.obj!==null&&s.obj!==undefined)?`Objectif ${s.obj}/20 ${icon}`:"Pas d'objectif fixé"}</span>
                   </div>
                 </div>
               );
@@ -265,40 +387,24 @@ export default function App() {
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
                   <input value={selected.name} onChange={e=>updSub(selected.id,{name:e.target.value})}
                     style={{fontFamily:"Syne,sans-serif",fontSize:16,fontWeight:700,background:"none",border:"none",borderBottom:`1px solid ${S.border}`,color:S.text,padding:"2px 0",outline:"none",width:200}} />
-                  <button onClick={()=>{setSubjects(p=>p.filter(x=>x.id!==selected.id));setSelectedId(null);}}
-                    style={{background:"#F8717115",border:"1px solid #F87171",color:"#F87171",borderRadius:8,padding:"5px 12px",fontSize:11,cursor:"pointer",fontFamily:"'DM Mono',monospace"}}>
-                    Supprimer
-                  </button>
-                </div>
-                <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
-                  <span style={{fontSize:11,color:S.muted}}>Coefficient matière</span>
-                  <input type="number" min="1" max="10" step="1" value={selected.coef}
-                    onChange={e=>updSub(selected.id,{coef:parseFloat(e.target.value)||1})}
-                    style={{...inp(),width:60,textAlign:"center"}} />
+                  <button onClick={()=>deleteSubject(selected.id)}
+                    style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16}}>×</button>
                 </div>
 
                 <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,fontFamily:"Syne,sans-serif"}}>NOTES</div>
-                {selected.grades.length===0&&<div style={{color:S.muted,fontSize:13,fontStyle:"italic",marginBottom:12}}>Aucune note</div>}
-                {selected.grades.map((g,i)=>(
-                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:S.bg,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
+                {(!selected.grades||selected.grades.length===0)&&<div style={{fontSize:12,color:S.muted,fontStyle:"italic",marginBottom:12}}>Aucune note pour l'instant.</div>}
+                {(selected.grades||[]).map((g,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:S.surface2,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
                     <div>
-                      <span style={{fontFamily:"Syne,sans-serif",fontSize:16,fontWeight:700,color:g.v>=14?"#34D399":g.v>=10?"#FBBF24":"#F87171"}}>{g.label||g.v}</span>
-                      <span style={{fontSize:11,color:S.muted}}>{g.label?` → ${g.v.toFixed(2)}/20`:"/20"} · coef {g.w}</span>
+                      <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14}}>{g.v}/20</span>
+                      <span style={{fontSize:11,color:S.muted,marginLeft:8}}>coef {g.w}{g.label?` · ${g.label}`:""}</span>
                     </div>
-                    <button onClick={()=>updSub(selected.id,{grades:selected.grades.filter((_,j)=>j!==i)})}
-                      style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:18}}>×</button>
+                    <button onClick={()=>deleteGrade(i)}
+                      style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:14}}>×</button>
                   </div>
                 ))}
-                {calcAvg(selected.grades)!==null&&(
-                  <div style={{background:selected.color+"15",borderRadius:8,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",border:`1px solid ${selected.color}30`,marginBottom:14}}>
-                    <span style={{fontSize:12,color:S.muted}}>Moyenne</span>
-                    <span style={{fontFamily:"Syne,sans-serif",fontSize:20,fontWeight:800,color:sc(calcAvg(selected.grades),selected.obj)}}>
-                      {calcAvg(selected.grades).toFixed(2)}/20
-                    </span>
-                  </div>
-                )}
 
-                <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,fontFamily:"Syne,sans-serif"}}>AJOUTER UNE NOTE</div>
+                <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,marginTop:12,fontFamily:"Syne,sans-serif"}}>AJOUTER UNE NOTE</div>
                 <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                   <input type="number" placeholder="Note /20" min="0" max="20" step="0.5"
                     value={newGrade.v} onChange={e=>setNewGrade(g=>({...g,v:e.target.value}))}
@@ -336,13 +442,12 @@ export default function App() {
 
             {subjects.map(s=>{
               const curAvg = calcAvg(s.grades);
-              const hasObj = s.obj!==null;
+              const hasObj = s.obj!==null&&s.obj!==undefined;
               const simAvg = hasObj?simAvgWithObj(subjects,s.id,s.obj):null;
               const simDiff = simAvg!==null&&avg!==null?simAvg-avg:null;
               const coefKey = `${s.id}`;
               const simC = parseFloat(simCoef[coefKey])||1;
               const needed = hasObj&&curAvg!==null?gradeNeeded(s.grades,s.obj,simC):null;
-              const needed1 = hasObj&&curAvg!==null?gradeNeeded(s.grades,s.obj,1):null;
               const needed2a = hasObj&&curAvg!==null?gradeNeeded(s.grades,s.obj,1):null;
 
               return (
@@ -357,12 +462,11 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Objective input */}
                   <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:hasObj?12:0}}>
                     <span style={{fontSize:11,color:S.muted,flexShrink:0}}>Objectif :</span>
                     <input type="number" min="0" max="20" step="0.5"
                       placeholder="Ex: 14"
-                      value={s.obj!==null?s.obj:""}
+                      value={hasObj?s.obj:""}
                       onChange={e=>setObj(s.id,e.target.value)}
                       style={{...inp(),width:80,textAlign:"center"}} />
                     <span style={{fontSize:11,color:S.muted}}>/20</span>
@@ -372,10 +476,8 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Simulation */}
                   {hasObj&&(
                     <div style={{background:S.surface2,borderRadius:10,padding:12,marginTop:4}}>
-                      {/* Impact on general avg */}
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
                         <span style={{fontSize:11,color:S.muted}}>Moyenne générale si objectif atteint</span>
                         <div style={{textAlign:"right"}}>
@@ -389,24 +491,18 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Notes needed */}
                       {curAvg!==null&&(
                         <>
                           <div style={{fontSize:10,color:S.muted,letterSpacing:2,marginBottom:8,fontFamily:"Syne,sans-serif"}}>NOTES NÉCESSAIRES</div>
-
-                          {/* 2 notes coef 1 */}
                           {needed2a!==null&&(
                             <div style={{marginBottom:8,background:S.bg,borderRadius:8,padding:"8px 10px"}}>
-                              <div style={{fontSize:11,color:S.muted,marginBottom:2}}>Option 2 notes coef 1 :</div>
+                              <div style={{fontSize:11,color:S.muted,marginBottom:2}}>Avec 1 note coef 1 :</div>
                               <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14,
                                 color:needed2a>20?"#F87171":needed2a>16?"#FBBF24":"#34D399"}}>
-                                {needed2a>20?"❌ Impossible":needed2a<=0?"✅ Déjà atteint !":
-                                  `${needed2a.toFixed(2)}/20 à chaque note`}
+                                {needed2a>20?"❌ Impossible":needed2a<=0?"✅ Déjà atteint !":`${needed2a.toFixed(2)}/20`}
                               </span>
                             </div>
                           )}
-
-                          {/* Custom coef */}
                           <div style={{background:S.bg,borderRadius:8,padding:"8px 10px"}}>
                             <div style={{fontSize:11,color:S.muted,marginBottom:6}}>Simuler avec 1 note de coef :</div>
                             <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -418,8 +514,7 @@ export default function App() {
                                 {needed!==null&&(
                                   <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14,
                                     color:needed>20?"#F87171":needed>16?"#FBBF24":"#34D399"}}>
-                                    → {needed>20?"❌ Impossible":needed<=0?"✅ Déjà atteint !":
-                                      `${needed.toFixed(2)}/20`}
+                                    → {needed>20?"❌ Impossible":needed<=0?"✅ Déjà atteint !":`${needed.toFixed(2)}/20`}
                                   </span>
                                 )}
                               </div>
@@ -436,129 +531,222 @@ export default function App() {
           </div>
         )}
 
-        {/* PERSO */}
-        {tab==="perso"&&(
+        {/* ÉVOLUTION */}
+        {tab==="evolution"&&(
           <div>
-            <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>MES DOSSIERS</div>
+            <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>HISTORIQUE DE PROGRESSION</div>
 
-            {/* Add folder */}
-            <div style={{display:"flex",gap:8,marginBottom:20}}>
-              <input placeholder="Nom du dossier (ex: Maths, Révisions EAF...)" value={newFolderName}
-                onChange={e=>setNewFolderName(e.target.value)}
-                onKeyDown={e=>e.key==="Enter"&&addFolder()}
-                style={{...inp(),flex:1}} />
-              <button onClick={addFolder} style={{background:S.accent,border:"none",color:"#fff",borderRadius:8,padding:"8px 16px",fontSize:18,cursor:"pointer"}}>+</button>
+            <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+              {["mois","trimestre","jour"].map(g=>(
+                <button key={g} onClick={()=>setGranularity(g)} style={{
+                  background:granularity===g?S.accent:S.surface,border:`1px solid ${granularity===g?S.accent:S.border}`,
+                  color:granularity===g?"#fff":S.muted,borderRadius:8,padding:"6px 12px",fontSize:11,
+                  cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:700,textTransform:"capitalize"
+                }}>{g==="jour"?"Détaillé":g}</button>
+              ))}
             </div>
 
-            {folders.length===0&&(
-              <div style={{textAlign:"center",padding:"40px 20px",color:S.muted}}>
-                <div style={{fontSize:40,marginBottom:12}}>📁</div>
-                <div style={{fontFamily:"Syne,sans-serif",fontSize:14}}>Aucun dossier créé</div>
-                <div style={{fontSize:12,marginTop:6}}>Crée un dossier et importe tes fichiers</div>
-              </div>
-            )}
+            <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
+              <button onClick={()=>setEvoSubject("global")} style={{
+                background:evoSubject==="global"?S.surface2:S.surface,border:`1px solid ${evoSubject==="global"?S.accent:S.border}`,
+                color:evoSubject==="global"?S.accent:S.muted,borderRadius:20,padding:"6px 14px",fontSize:11,
+                cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:600
+              }}>Global</button>
+              {subjects.map(s=>(
+                <button key={s.id} onClick={()=>setEvoSubject(String(s.id))} style={{
+                  background:evoSubject===String(s.id)?s.color:S.surface,border:`1px solid ${s.color}60`,
+                  color:evoSubject===String(s.id)?"#fff":s.color,borderRadius:20,padding:"6px 14px",fontSize:11,
+                  cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:600
+                }}>{s.name}</button>
+              ))}
+            </div>
 
-            {folders.map(folder=>(
-              <div key={folder.id} style={{background:S.surface,borderRadius:14,marginBottom:12,border:`1px solid ${S.border}`,overflow:"hidden"}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 14px",
-                  cursor:"pointer",borderBottom:selectedFolder===folder.id?`1px solid ${S.border}`:"none"}}
-                  onClick={()=>setSelectedFolder(selectedFolder===folder.id?null:folder.id)}>
-                  <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <span style={{fontSize:20}}>{selectedFolder===folder.id?"📂":"📁"}</span>
-                    <div>
-                      <div style={{fontFamily:"Syne,sans-serif",fontSize:13,fontWeight:700}}>{folder.name}</div>
-                      <div style={{fontSize:10,color:S.muted,marginTop:2}}>{folder.files.length} fichier{folder.files.length!==1?"s":""}</div>
-                    </div>
-                  </div>
-                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                    <button onClick={e=>{e.stopPropagation();setFolders(p=>p.filter(f=>f.id!==folder.id));if(selectedFolder===folder.id)setSelectedFolder(null);}}
-                      style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16}}>×</button>
-                    <span style={{color:S.muted,fontSize:14}}>{selectedFolder===folder.id?"▲":"▼"}</span>
-                  </div>
+            <div style={{background:S.surface,borderRadius:16,padding:16,border:`1px solid ${S.border}`}}>
+              {evoData.length===0?(
+                <div style={{textAlign:"center",padding:"30px 0",color:S.muted,fontSize:12,fontStyle:"italic"}}>
+                  Pas encore assez de notes pour tracer une évolution.
                 </div>
-
-                {selectedFolder===folder.id&&(
-                  <div style={{padding:14}}>
-                    {/* Upload button */}
-                    <input type="file" multiple ref={fileInputRef} style={{display:"none"}}
-                      onChange={e=>handleFileUpload(folder.id,e.target.files)} />
-                    <button onClick={()=>fileInputRef.current?.click()}
-                      style={{background:S.surface2,border:`1px dashed ${S.border}`,color:S.text,borderRadius:10,
-                        padding:"12px 20px",width:"100%",cursor:"pointer",fontFamily:"'DM Mono',monospace",
-                        fontSize:13,marginBottom:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
-                      <span style={{fontSize:20}}>📎</span> Importer des fichiers
-                    </button>
-
-                    {folder.files.length===0&&(
-                      <div style={{textAlign:"center",fontSize:12,color:S.muted,padding:"8px 0"}}>Aucun fichier importé</div>
-                    )}
-                    {folder.files.map((f,i)=>(
-                      <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
-                        background:S.bg,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
-                        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
-                          <span style={{fontSize:16}}>
-                            {f.type.includes("pdf")?"📄":f.type.includes("image")?"🖼️":f.type.includes("text")?"📝":"📎"}
-                          </span>
-                          <div style={{minWidth:0}}>
-                            <div style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.name}</div>
-                            <div style={{fontSize:10,color:S.muted}}>{f.date} · {f.size>1024*1024?(f.size/(1024*1024)).toFixed(1)+"MB":(f.size/1024).toFixed(0)+"KB"}</div>
-                          </div>
-                        </div>
-                        <button onClick={()=>{
-                          setFolders(p=>p.map(fo=>fo.id===folder.id?{...fo,files:fo.files.filter((_,j)=>j!==i)}:fo));
-                        }} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16,flexShrink:0}}>×</button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
+              ):(
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={evoData} margin={{top:10,right:10,left:-20,bottom:0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={S.border} />
+                    <XAxis dataKey="label" tick={{fill:S.muted,fontSize:10}} />
+                    <YAxis domain={[0,20]} tick={{fill:S.muted,fontSize:10}} />
+                    <Tooltip contentStyle={{background:S.surface2,border:`1px solid ${S.border}`,borderRadius:8,fontSize:12}}
+                      labelStyle={{color:S.text}} />
+                    <Line type="monotone" dataKey="avg" stroke={evoSubject==="global"?S.accent:subjects.find(s=>s.id===parseInt(evoSubject))?.color||S.accent}
+                      strokeWidth={2.5} dot={{r:4}} activeDot={{r:6}} />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
           </div>
         )}
 
-        {/* CHAT */}
-        {tab==="chat"&&(
-          <div style={{display:"flex",flexDirection:"column",height:"calc(100vh - 360px)",minHeight:300}}>
-            <div style={{flex:1,overflowY:"auto",paddingBottom:8}}>
-              <div style={{background:S.surface2,borderRadius:"4px 14px 14px 14px",padding:"10px 14px",fontSize:13,lineHeight:1.7,marginBottom:12,display:"inline-block",maxWidth:"88%"}}>
-                Salut Ilan ! 🎯<br/>
-                Dis-moi ce que tu veux :<br/>
-                <span style={{color:S.muted,fontSize:12}}>"Ajoute 16 en maths coef 2"<br/>"Qu'est-ce que je dois bosser ?"</span>
+        {/* PERSO */}
+        {tab==="perso"&&(
+          <div>
+            {/* Sous-onglets */}
+            <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap"}}>
+              {[["dossiers","📁","Dossiers"],["emploi","🗓️","Emploi du temps"],["taches","✅","Tâches"]].map(([key,icon,label])=>(
+                <button key={key} onClick={()=>setPersoTab(key)} style={{
+                  flex:"1 1 100px",background:persoTab===key?S.accent:S.surface,
+                  border:`1px solid ${persoTab===key?S.accent:S.border}`,
+                  color:persoTab===key?"#fff":S.muted,borderRadius:10,padding:"10px 8px",
+                  fontSize:11,cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:700,
+                  display:"flex",flexDirection:"column",alignItems:"center",gap:4,transition:"all 0.2s"
+                }}>
+                  <span style={{fontSize:16}}>{icon}</span>
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* DOSSIERS */}
+            {persoTab==="dossiers"&&(
+              <div>
+                <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>MES DOSSIERS</div>
+                <div style={{display:"flex",gap:8,marginBottom:20}}>
+                  <input placeholder="Nom du dossier (ex: Maths, Révisions EAF...)" value={newFolderName}
+                    onChange={e=>setNewFolderName(e.target.value)}
+                    onKeyDown={e=>e.key==="Enter"&&addFolder()}
+                    style={{...inp(),flex:1}} />
+                  <button onClick={addFolder} style={{background:S.accent,border:"none",color:"#fff",borderRadius:8,padding:"8px 16px",fontSize:18,cursor:"pointer"}}>+</button>
+                </div>
+
+                {folders.length===0&&(
+                  <div style={{textAlign:"center",padding:"40px 20px",color:S.muted}}>
+                    <div style={{fontSize:40,marginBottom:12}}>📁</div>
+                    <div style={{fontFamily:"Syne,sans-serif",fontSize:14}}>Aucun dossier créé</div>
+                    <div style={{fontSize:12,marginTop:6}}>Crée un dossier et importe tes fichiers importants</div>
+                  </div>
+                )}
+
+                {folders.map(folder=>(
+                  <div key={folder.id} style={{background:S.surface,borderRadius:14,marginBottom:12,border:`1px solid ${S.border}`,overflow:"hidden"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 14px",
+                      cursor:"pointer",borderBottom:selectedFolder===folder.id?`1px solid ${S.border}`:"none"}}
+                      onClick={()=>setSelectedFolder(selectedFolder===folder.id?null:folder.id)}>
+                      <div style={{display:"flex",alignItems:"center",gap:10}}>
+                        <span style={{fontSize:20}}>{selectedFolder===folder.id?"📂":"📁"}</span>
+                        <div>
+                          <div style={{fontFamily:"Syne,sans-serif",fontSize:13,fontWeight:700}}>{folder.name}</div>
+                          <div style={{fontSize:10,color:S.muted,marginTop:2}}>{folder.files.length} fichier{folder.files.length!==1?"s":""}</div>
+                        </div>
+                      </div>
+                      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                        <button onClick={e=>{e.stopPropagation();deleteFolder(folder.id);}}
+                          style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16}}>×</button>
+                        <span style={{color:S.muted,fontSize:14}}>{selectedFolder===folder.id?"▲":"▼"}</span>
+                      </div>
+                    </div>
+
+                    {selectedFolder===folder.id&&(
+                      <div style={{padding:14}}>
+                        <label style={{display:"block"}}>
+                          <input type="file" multiple style={{display:"none"}}
+                            onChange={e=>handleFileUpload(folder.id,e.target.files)} />
+                          <div style={{background:S.surface2,border:`1px dashed ${S.border}`,color:S.text,borderRadius:10,
+                            padding:"12px 20px",width:"100%",cursor:"pointer",fontFamily:"'DM Mono',monospace",
+                            fontSize:13,marginBottom:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+                            <span style={{fontSize:20}}>📎</span> Importer des fichiers
+                          </div>
+                        </label>
+
+                        {folder.files.length===0&&(
+                          <div style={{textAlign:"center",fontSize:12,color:S.muted,padding:"8px 0"}}>Aucun fichier importé</div>
+                        )}
+                        {folder.files.map((f)=>(
+                          <div key={f.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                            background:S.bg,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
+                            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+                              <span style={{fontSize:16}}>
+                                {f.type&&f.type.includes("pdf")?"📄":f.type&&f.type.includes("image")?"🖼️":f.type&&f.type.includes("text")?"📝":"📎"}
+                              </span>
+                              <div style={{minWidth:0}}>
+                                <div style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.name}</div>
+                                <div style={{fontSize:10,color:S.muted}}>{f.date||new Date(f.created_at).toLocaleDateString("fr-FR")} · {f.size>1024*1024?(f.size/(1024*1024)).toFixed(1)+"MB":(f.size/1024).toFixed(0)+"KB"}</div>
+                              </div>
+                            </div>
+                            <button onClick={()=>deleteFile(folder.id,f.id)} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16,flexShrink:0}}>×</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
-              {chatHistory.map((m,i)=>(
-                <div key={i} style={{marginBottom:12,textAlign:m.role==="user"?"right":"left"}}>
-                  <div style={{display:"inline-block",maxWidth:"88%",padding:"10px 14px",
-                    borderRadius:m.role==="user"?"14px 14px 4px 14px":"4px 14px 14px 14px",
-                    background:m.role==="user"?S.accent:S.surface2,fontSize:13,lineHeight:1.6,whiteSpace:"pre-wrap"}}>
-                    {m.content}
+            )}
+
+            {/* EMPLOI DU TEMPS */}
+            {persoTab==="emploi"&&(
+              <div>
+                <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>EMPLOI DU TEMPS</div>
+                <div style={{overflowX:"auto"}}>
+                  <div style={{display:"grid",gridTemplateColumns:`60px repeat(${DAYS.length}, 1fr)`,gap:3,minWidth:480}}>
+                    <div />
+                    {DAYS.map(d=>(
+                      <div key={d} style={{textAlign:"center",fontSize:10,color:S.muted,fontFamily:"Syne,sans-serif",fontWeight:700,paddingBottom:6}}>{d}</div>
+                    ))}
+                    {SLOTS.map(slot=>(
+                      <div key={slot} style={{display:"contents"}}>
+                        <div style={{fontSize:9,color:S.muted,display:"flex",alignItems:"center",paddingRight:4}}>{slot}</div>
+                        {DAYS.map(day=>{
+                          const key = `${day}_${slot}`;
+                          return (
+                            <input key={key} value={schedule[key]||""}
+                              onChange={e=>setScheduleSlot(day,slot,e.target.value)}
+                              placeholder="—"
+                              style={{...inp({padding:"6px 4px",fontSize:10,textAlign:"center",borderRadius:5}),width:"100%"}} />
+                          );
+                        })}
+                      </div>
+                    ))}
                   </div>
                 </div>
-              ))}
-              {chatLoading&&(
-                <div style={{marginBottom:12}}>
-                  <div style={{display:"inline-block",padding:"10px 14px",borderRadius:"4px 14px 14px 14px",background:S.surface2}}>
-                    <div style={{display:"flex",gap:4}}>
-                      {[0,1,2].map(i=>(
-                        <div key={i} style={{width:6,height:6,borderRadius:"50%",background:S.muted,
-                          animation:"b 1.2s infinite",animationDelay:`${i*0.2}s`}} />
-                      ))}
+              </div>
+            )}
+
+            {/* TÂCHES */}
+            {persoTab==="taches"&&(
+              <div>
+                <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>MES TÂCHES</div>
+                <div style={{display:"flex",gap:8,marginBottom:16}}>
+                  <input placeholder="Nouvelle tâche..." value={newTask}
+                    onChange={e=>setNewTask(e.target.value)}
+                    onKeyDown={e=>e.key==="Enter"&&addTask()}
+                    style={{...inp(),flex:1}} />
+                  <button onClick={addTask} style={{background:S.accent,border:"none",color:"#fff",borderRadius:8,padding:"8px 16px",fontSize:18,cursor:"pointer"}}>+</button>
+                </div>
+
+                {tasks.length===0&&(
+                  <div style={{textAlign:"center",padding:"20px",color:S.muted,fontSize:12,fontStyle:"italic"}}>Aucune tâche pour l'instant.</div>
+                )}
+                {tasks.map(t=>(
+                  <div key={t.id} style={{background:S.surface,borderRadius:10,padding:"10px 12px",marginBottom:8,border:`1px solid ${S.border}`}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10}}>
+                      <button onClick={()=>toggleTask(t.id)} style={{
+                        width:18,height:18,borderRadius:5,border:`2px solid ${t.done?"#34D399":S.muted}`,
+                        background:t.done?"#34D399":"none",cursor:"pointer",flexShrink:0,color:"#fff",fontSize:11,
+                        display:"flex",alignItems:"center",justifyContent:"center"
+                      }}>{t.done?"✓":""}</button>
+                      <span style={{flex:1,fontSize:13,textDecoration:t.done?"line-through":"none",color:t.done?S.muted:S.text}}>{t.text}</span>
+                      <button onClick={()=>deleteTask(t.id)} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16}}>×</button>
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8,paddingLeft:28}}>
+                      <span style={{fontSize:14}}>⏰</span>
+                      <input type="datetime-local" value={t.alarm||""}
+                        onChange={e=>setTaskAlarm(t.id,e.target.value)}
+                        style={{...inp({padding:"5px 8px",fontSize:11}),flex:1}} />
+                      {t.alarm&&(
+                        <button onClick={()=>setTaskAlarm(t.id,"")}
+                          style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:13}}>×</button>
+                      )}
                     </div>
                   </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-            <style>{`@keyframes b{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-6px)}}`}</style>
-            <div style={{display:"flex",gap:8,paddingTop:10,borderTop:`1px solid ${S.border}`}}>
-              <textarea value={chatInput} onChange={e=>setChatInput(e.target.value)}
-                onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendChat();}}}
-                placeholder="Écris à ton coach..." rows={2}
-                style={{...inp(),flex:1,borderRadius:12,padding:"12px 14px",lineHeight:1.5}} />
-              <button onClick={sendChat} disabled={chatLoading||!chatInput.trim()}
-                style={{background:chatLoading||!chatInput.trim()?S.surface2:S.accent,border:"none",
-                  color:"#fff",borderRadius:12,padding:"12px 16px",cursor:chatLoading?"not-allowed":"pointer",
-                  fontSize:16,flexShrink:0,opacity:chatLoading?0.4:1,transition:"all 0.2s"}}>➤</button>
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
