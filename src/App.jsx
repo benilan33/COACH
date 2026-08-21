@@ -238,20 +238,34 @@ export default function App() {
   }
 
   async function handleFileUpload(folderId, fileList) {
-    const rows = Array.from(fileList).map(file => ({
-      folder_id: folderId, name: file.name, size: file.size, type: file.type
-    }));
-    const { data, error } = await supabase.from('files').insert(rows).select();
+    const uploaded = [];
+    for (const file of Array.from(fileList)) {
+      const path = `${folderId}/${Date.now()}_${file.name}`;
+      const { error: upErr } = await supabase.storage.from('fichiers').upload(path, file);
+      if (upErr) { console.error('upload:', upErr); continue; }
+      uploaded.push({ folder_id: folderId, name: file.name, size: file.size, type: file.type, storage_path: path });
+    }
+    if (uploaded.length === 0) return;
+    const { data, error } = await supabase.from('files').insert(uploaded).select();
     if (error) { console.error('handleFileUpload:', error); return; }
     setFolders(p => p.map(f => f.id === folderId
       ? {...f, files:[...f.files, ...data.map(d=>({...d, date:new Date(d.created_at).toLocaleDateString("fr-FR")}))]}
       : f));
   }
 
-  async function deleteFile(folderId, fileId) {
+  function openFile(storagePath) {
+    const { data } = supabase.storage.from('fichiers').getPublicUrl(storagePath);
+    if (data?.publicUrl) window.open(data.publicUrl, '_blank');
+  }
+
+  async function deleteFile(folderId, fileId, storagePath) {
     setFolders(p => p.map(f => f.id === folderId
       ? {...f, files: f.files.filter(file => file.id !== fileId)}
       : f));
+    if (storagePath) {
+      const { error: storErr } = await supabase.storage.from('fichiers').remove([storagePath]);
+      if (storErr) console.error('deleteFile storage:', storErr);
+    }
     const { error } = await supabase.from('files').delete().eq('id', fileId);
     if (error) console.error('deleteFile:', error);
   }
@@ -659,16 +673,16 @@ export default function App() {
                         {folder.files.map((f)=>(
                           <div key={f.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
                             background:S.bg,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
-                            <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+                            <div onClick={()=>openFile(f.storage_path)} style={{display:"flex",alignItems:"center",gap:8,minWidth:0,cursor:f.storage_path?"pointer":"default",flex:1}}>
                               <span style={{fontSize:16}}>
                                 {f.type&&f.type.includes("pdf")?"📄":f.type&&f.type.includes("image")?"🖼️":f.type&&f.type.includes("text")?"📝":"📎"}
                               </span>
                               <div style={{minWidth:0}}>
-                                <div style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.name}</div>
+                                <div style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",textDecoration:f.storage_path?"underline":"none",textDecorationColor:S.border}}>{f.name}</div>
                                 <div style={{fontSize:10,color:S.muted}}>{f.date||new Date(f.created_at).toLocaleDateString("fr-FR")} · {f.size>1024*1024?(f.size/(1024*1024)).toFixed(1)+"MB":(f.size/1024).toFixed(0)+"KB"}</div>
                               </div>
                             </div>
-                            <button onClick={()=>deleteFile(folder.id,f.id)} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16,flexShrink:0}}>×</button>
+                            <button onClick={()=>deleteFile(folder.id,f.id,f.storage_path)} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16,flexShrink:0}}>×</button>
                           </div>
                         ))}
                       </div>
