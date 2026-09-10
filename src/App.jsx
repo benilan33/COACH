@@ -4,8 +4,70 @@ import { supabase } from "./supabaseClient";
 
 const COLORS = ["#7C6DFA","#34D399","#F87171","#FBBF24","#60A5FA","#F472B6","#A78BFA","#FB923C","#2DD4BF"];
 
-const SLOTS = ["8h-9h","9h-10h","10h-11h","11h-12h","12h-13h","13h-14h","14h-15h","15h-16h","16h-17h","17h-18h"];
+const SLOTS = ["8h12-9h10","9h10-10h05","10h25-11h20","11h20-12h15","13h35-14h30","14h30-15h25","15h40-16h35","16h35-17h30"];
 const DAYS = ["Lun","Mar","Mer","Jeu","Ven","Sam"];
+
+const SCHEDULE_COLORS = {
+  "Maths Expertes":"#7C6DFA","Hist-Géo":"#34D399","Mathématiques":"#60A5FA",
+  "Anglais 12":"#F472B6","NSI":"#FB923C","Philosophie":"#A78BFA",
+  "Espagnol 12":"#FBBF24","Ens. Sci. Physique-Chimie":"#2DD4BF","Ens. Sci. SVT":"#F87171",
+  "Maths Spé":"#818CF8","EPS":"#4ADE80","EMC":"#FCD34D",
+  "Devoir Surveillé":"#94A3B8","Vie de Classe":"#C084FC"
+};
+
+const SCHEDULE_DATA = {
+  Lun: [
+    {both:{subject:"Maths Expertes",teacher:"M. Falomir",room:"G13"}},
+    {both:{subject:"Hist-Géo",teacher:"Mme Rault",room:"D04"}},
+    {both:{subject:"Mathématiques",teacher:"M. Falomir",room:"E14"}},
+    {both:{subject:"Mathématiques",teacher:"M. Falomir",room:"E14"}},
+    null,
+    {a:{subject:"Anglais 12",teacher:"Mme Aubijoux",room:"D04"}},
+    {both:{subject:"Hist-Géo",teacher:"Mme Rault",room:"D04"}},
+    null,
+  ],
+  Mar: [
+    {both:{subject:"NSI",teacher:"",room:"G1"}},
+    {both:{subject:"NSI",teacher:"",room:"G1"}},
+    {both:{subject:"Philosophie",teacher:"Mme Amblard",room:"D04"}},
+    {a:{subject:"Espagnol 12",teacher:"Mme Foueillassar-Baeza",room:"D04"}, b:{subject:"Philosophie",teacher:"Mme Amblard",room:"D04"}},
+    {both:{subject:"Maths Spé",teacher:"",room:""}},
+    {both:{subject:"Maths Spé",teacher:"",room:""}},
+    {a:{subject:"Ens. Sci. SVT",teacher:"Mme Bridon",room:"D04"}, b:{subject:"Hist-Géo",teacher:"Mme Rault",room:"D04"}},
+    null,
+  ],
+  Mer: [
+    {b:{subject:"NSI",teacher:"",room:"G11"}},
+    {b:{subject:"NSI",teacher:"",room:"G11"}},
+    {both:{subject:"Philosophie",teacher:"Mme Amblard",room:"D04"}},
+    {both:{subject:"Ens. Sci. Physique-Chimie",teacher:"M. Caumes",room:"D04"}},
+    {both:{subject:"Maths Expertes",teacher:"M. Falomir",room:"G13"}},
+    {both:{subject:"Maths Expertes",teacher:"M. Falomir",room:"G13"}},
+    null,
+    null,
+  ],
+  Jeu: [
+    {both:{subject:"Maths Spé",teacher:"",room:""}},
+    {both:{subject:"Maths Spé",teacher:"",room:""}},
+    {both:{subject:"EPS",teacher:"M. Dupont",room:"Gym"}},
+    {both:{subject:"EPS",teacher:"M. Dupont",room:"Gym"}},
+    {a:{subject:"Anglais 12",teacher:"Mme Aubijoux",room:"D04"}, b:{subject:"Devoir Surveillé",teacher:"",room:"D04"}},
+    {a:{subject:"Anglais 12",teacher:"Mme Aubijoux",room:"D04"}, b:{subject:"Devoir Surveillé",teacher:"",room:"D04"}},
+    {a:{subject:"EMC",teacher:"Mme Rault",room:"D04"}, b:{subject:"Philosophie",teacher:"Mme Amblard",room:"D04"}},
+    {a:{subject:"Hist-Géo",teacher:"Mme Rault",room:"D04"}, b:{subject:"Espagnol 12",teacher:"Mme Foueillassar-Baeza",room:"D04"}},
+  ],
+  Ven: [
+    null,
+    {a:{subject:"Ens. Sci. SVT",teacher:"Mme Bridon",room:"D04"}, b:{subject:"Vie de Classe",teacher:"M. Falomir",room:"D04"}},
+    {both:{subject:"NSI",teacher:"",room:""}},
+    {both:{subject:"NSI",teacher:"",room:""}},
+    {both:{subject:"Philosophie",teacher:"Mme Amblard",room:"D04"}},
+    {both:{subject:"Espagnol 12",teacher:"Mme Foueillassar-Baeza",room:"D04"}},
+    {b:{subject:"Anglais 12",teacher:"Mme Aubijoux",room:"D04"}},
+    null,
+  ],
+  Sam: [null,null,null,null,null,null,null,null],
+};
 
 function calcAvg(grades) {
   if (!grades || !grades.length) return null;
@@ -83,6 +145,13 @@ export default function App() {
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [target, setTarget] = useState(15);
+
+  async function updateTarget(value) {
+    const v = parseFloat(value) || 15;
+    setTarget(v);
+    const { error } = await supabase.from('settings').upsert({id:1, target:v});
+    if (error) console.error('updateTarget:', error);
+  }
   const [tab, setTab] = useState("dashboard");
   const [selectedId, setSelectedId] = useState(null);
   const [newGrade, setNewGrade] = useState({v:"",w:"1",label:""});
@@ -119,13 +188,9 @@ export default function App() {
         })));
       }
 
-      const { data: scheduleData, error: e5 } = await supabase.from('schedule').select('*');
-      if (e5) console.error('schedule:', e5);
-      else {
-        const map = {};
-        (scheduleData || []).forEach(row => { map[`${row.day}_${row.slot}`] = row.content; });
-        setSchedule(map);
-      }
+      const { data: settingsData, error: e5 } = await supabase.from('settings').select('*').eq('id', 1).single();
+      if (e5) console.error('settings:', e5);
+      else if (settingsData) setTarget(settingsData.target ?? 15);
 
       setLoading(false);
     }
@@ -212,10 +277,13 @@ export default function App() {
   }
 
   // ---- Emploi du temps ----
-  async function setScheduleSlot(day, slot, value) {
-    setSchedule(p => ({...p, [`${day}_${slot}`]: value}));
+  async function setScheduleSlot(day, slot, week, value) {
+    const key = `${day}_${slot}`;
+    const current = schedule[key] || {a:"", b:""};
+    const updated = {...current, [week]: value};
+    setSchedule(p => ({...p, [key]: updated}));
     const { error } = await supabase.from('schedule')
-      .upsert({day, slot, content:value}, {onConflict:'day,slot'});
+      .upsert({day, slot, content_a:updated.a, content_b:updated.b}, {onConflict:'day,slot'});
     if (error) console.error('setScheduleSlot:', error);
   }
 
@@ -311,7 +379,7 @@ export default function App() {
         <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,marginTop:14}}>
           <span style={{fontSize:12,color:S.muted,fontFamily:"Syne,sans-serif",letterSpacing:2}}>OBJECTIF</span>
           <input type="number" min="0" max="20" step="0.5" value={target}
-            onChange={e=>setTarget(parseFloat(e.target.value)||15)}
+            onChange={e=>updateTarget(e.target.value)}
             style={{...inp(),width:64,fontSize:18,textAlign:"center",fontFamily:"Syne,sans-serif",fontWeight:700,padding:"6px 10px",background:S.surface2}} />
           <span style={{fontSize:14,color:S.muted}}>/20</span>
         </div>
@@ -695,23 +763,45 @@ export default function App() {
             {/* EMPLOI DU TEMPS */}
             {persoTab==="emploi"&&(
               <div>
-                <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>EMPLOI DU TEMPS</div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <div style={{fontSize:10,color:S.muted,letterSpacing:3,fontFamily:"Syne,sans-serif"}}>EMPLOI DU TEMPS</div>
+                  <div style={{fontSize:9,color:S.muted,display:"flex",gap:10}}>
+                    <span>↗ Sem. A</span>
+                    <span>↙ Sem. B</span>
+                  </div>
+                </div>
                 <div style={{overflowX:"auto"}}>
-                  <div style={{display:"grid",gridTemplateColumns:`60px repeat(${DAYS.length}, 1fr)`,gap:3,minWidth:480}}>
+                  <div style={{display:"grid",gridTemplateColumns:`60px repeat(${DAYS.length}, 1fr)`,gap:3,minWidth:560}}>
                     <div />
                     {DAYS.map(d=>(
                       <div key={d} style={{textAlign:"center",fontSize:10,color:S.muted,fontFamily:"Syne,sans-serif",fontWeight:700,paddingBottom:6}}>{d}</div>
                     ))}
-                    {SLOTS.map(slot=>(
+                    {SLOTS.map((slot,i)=>(
                       <div key={slot} style={{display:"contents"}}>
                         <div style={{fontSize:9,color:S.muted,display:"flex",alignItems:"center",paddingRight:4}}>{slot}</div>
                         {DAYS.map(day=>{
-                          const key = `${day}_${slot}`;
+                          const entry = SCHEDULE_DATA[day][i];
+                          if (!entry) {
+                            return <div key={day} style={{minHeight:40,borderRadius:5,border:`1px solid ${S.border}`,background:S.surface}} />;
+                          }
+                          if (entry.both) {
+                            const c = SCHEDULE_COLORS[entry.both.subject] || S.accent;
+                            return (
+                              <div key={day} style={{minHeight:40,borderRadius:5,background:`${c}22`,border:`1px solid ${c}70`,
+                                display:"flex",alignItems:"center",justifyContent:"center",padding:2,textAlign:"center"}}>
+                                <span style={{fontSize:8,color:c,fontFamily:"Syne,sans-serif",fontWeight:700,lineHeight:1.15}}>{entry.both.subject}</span>
+                              </div>
+                            );
+                          }
+                          const ca = entry.a ? (SCHEDULE_COLORS[entry.a.subject] || S.accent) : null;
+                          const cb = entry.b ? (SCHEDULE_COLORS[entry.b.subject] || S.accent) : null;
                           return (
-                            <input key={key} value={schedule[key]||""}
-                              onChange={e=>setScheduleSlot(day,slot,e.target.value)}
-                              placeholder="—"
-                              style={{...inp({padding:"6px 4px",fontSize:10,textAlign:"center",borderRadius:5}),width:"100%"}} />
+                            <div key={day} style={{position:"relative",minHeight:40,borderRadius:5,border:`1px solid ${S.border}`,overflow:"hidden",background:S.surface}}>
+                              {ca && <div style={{position:"absolute",inset:0,clipPath:"polygon(0 0, 100% 0, 100% 100%)",background:`${ca}25`}} />}
+                              {cb && <div style={{position:"absolute",inset:0,clipPath:"polygon(0 0, 0 100%, 100% 100%)",background:`${cb}25`}} />}
+                              <div style={{position:"absolute",top:1,right:1,maxWidth:"58%",fontSize:7,color:ca||S.muted,textAlign:"right",fontFamily:"Syne,sans-serif",fontWeight:700,lineHeight:1.1}}>{entry.a?.subject||""}</div>
+                              <div style={{position:"absolute",bottom:1,left:1,maxWidth:"58%",fontSize:7,color:cb||S.muted,textAlign:"left",fontFamily:"Syne,sans-serif",fontWeight:700,lineHeight:1.1}}>{entry.b?.subject||""}</div>
+                            </div>
                           );
                         })}
                       </div>
