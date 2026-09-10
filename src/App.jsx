@@ -188,19 +188,9 @@ export default function App() {
         })));
       }
 
-<<<<<<< HEAD
       const { data: settingsData, error: e5 } = await supabase.from('settings').select('*').eq('id', 1).single();
       if (e5) console.error('settings:', e5);
       else if (settingsData) setTarget(settingsData.target ?? 15);
-=======
-      const { data: scheduleData, error: e5 } = await supabase.from('schedule').select('*');
-      if (e5) console.error('schedule:', e5);
-      else {
-        const map = {};
-        (scheduleData || []).forEach(row => { map[`${row.day}_${row.slot}`] = {a: row.content_a||"", b: row.content_b||""}; });
-        setSchedule(map);
-      }
->>>>>>> 7481d75f9cc8d9f70e44e8dd871b72319078a1ca
 
       setLoading(false);
     }
