@@ -177,6 +177,8 @@ export default function App() {
   const [tab, setTab] = useState("dashboard");
   const [selectedId, setSelectedId] = useState(null);
   const [newGrade, setNewGrade] = useState({v:"",w:"1",label:"",classAvg:"",maxGrade:""});
+  const [editing, setEditing] = useState(null); // {subId, idx}
+  const [editDraft, setEditDraft] = useState(null);
   const [newSubName, setNewSubName] = useState("");
   const [newSubCoef, setNewSubCoef] = useState("1");
   const [simCoef, setSimCoef] = useState({});
@@ -248,6 +250,42 @@ export default function App() {
   async function deleteGrade(index) {
     const newGrades = selected.grades.filter((_,j)=>j!==index);
     await updSub(selected.id, {grades:newGrades});
+  }
+
+  function startEditGrade(subId, idx, g) {
+    setEditing({subId, idx});
+    setEditDraft({
+      v: String(g.v ?? ""),
+      w: String(g.w ?? "1"),
+      label: g.label ?? "",
+      date: g.date || new Date().toISOString().slice(0,10),
+      classAvg: g.classAvg!=null ? String(g.classAvg) : "",
+      maxGrade: g.maxGrade!=null ? String(g.maxGrade) : "",
+    });
+  }
+
+  function cancelEditGrade() {
+    setEditing(null);
+    setEditDraft(null);
+  }
+
+  async function saveEditGrade() {
+    if (!editing || !editDraft) return;
+    const v = parseFloat(editDraft.v), w = parseFloat(editDraft.w) || 1;
+    if (isNaN(v) || v < 0 || v > 20) return;
+    const subject = subjects.find(s=>s.id===editing.subId);
+    if (!subject) return;
+    const classAvgNum = editDraft.classAvg !== "" ? parseFloat(editDraft.classAvg) : null;
+    const maxGradeNum = editDraft.maxGrade !== "" ? parseFloat(editDraft.maxGrade) : null;
+    const newGrades = (subject.grades||[]).map((g,j)=> j===editing.idx ? {
+      v, w, label: editDraft.label,
+      date: editDraft.date || g.date,
+      classAvg: (classAvgNum!==null && !isNaN(classAvgNum)) ? classAvgNum : null,
+      maxGrade: (maxGradeNum!==null && !isNaN(maxGradeNum)) ? maxGradeNum : null,
+    } : g);
+    await updSub(editing.subId, {grades:newGrades});
+    setEditing(null);
+    setEditDraft(null);
   }
 
   async function addSubject() {
