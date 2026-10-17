@@ -87,6 +87,18 @@ function sc(avg, obj) {
   if(avg>=obj-2) return "#FBBF24";
   return "#F87171";
 }
+function buildLossRanking(subjects) {
+  return subjects
+    .map(s => {
+      const a = calcAvg(s.grades);
+      if (a===null || s.obj===null || s.obj===undefined) return null;
+      const deficit = s.obj - a;
+      if (deficit <= 0) return null;
+      return { id:s.id, name:s.name, color:s.color, avg:a, obj:s.obj, coef:s.coef, deficit, weighted: deficit*s.coef };
+    })
+    .filter(Boolean)
+    .sort((x,y)=>y.weighted-x.weighted);
+}
 function simAvgWithObj(subjects, subId, objVal) {
   let tot=0,w=0;
   subjects.forEach(s=>{
@@ -106,6 +118,16 @@ const S = { bg:"#0C0C10",surface:"#13131A",surface2:"#1C1C28",border:"#252535",t
 
 function inp(extra={}) {
   return { background:S.bg,border:`1px solid ${S.border}`,color:S.text,borderRadius:8,padding:"8px 10px",fontFamily:"'DM Mono',monospace",fontSize:13,outline:"none",...extra };
+}
+
+function buildSubjectCompareData(grades) {
+  const sorted = [...(grades||[])].sort((a,b)=>new Date(a.date)-new Date(b.date));
+  return sorted.map((g,i)=>({
+    label: g.label || `Note ${i+1}`,
+    moi: g.v,
+    classe: g.classAvg ?? null,
+    meilleure: g.maxGrade ?? null,
+  }));
 }
 
 function buildEvolutionData(subjects, granularity) {
@@ -154,7 +176,7 @@ export default function App() {
   }
   const [tab, setTab] = useState("dashboard");
   const [selectedId, setSelectedId] = useState(null);
-  const [newGrade, setNewGrade] = useState({v:"",w:"1",label:""});
+  const [newGrade, setNewGrade] = useState({v:"",w:"1",label:"",classAvg:"",maxGrade:""});
   const [newSubName, setNewSubName] = useState("");
   const [newSubCoef, setNewSubCoef] = useState("1");
   const [simCoef, setSimCoef] = useState({});
@@ -212,9 +234,15 @@ export default function App() {
   async function addGrade() {
     const v = parseFloat(newGrade.v), w = parseFloat(newGrade.w) || 1;
     if (isNaN(v) || v < 0 || v > 20 || !selectedId) return;
-    const newGrades = [...(selected.grades||[]), {v, w, label:newGrade.label, date:new Date().toISOString().slice(0,10)}];
+    const classAvgNum = newGrade.classAvg !== "" ? parseFloat(newGrade.classAvg) : null;
+    const maxGradeNum = newGrade.maxGrade !== "" ? parseFloat(newGrade.maxGrade) : null;
+    const newGrades = [...(selected.grades||[]), {
+      v, w, label:newGrade.label, date:new Date().toISOString().slice(0,10),
+      classAvg: (classAvgNum!==null && !isNaN(classAvgNum)) ? classAvgNum : null,
+      maxGrade: (maxGradeNum!==null && !isNaN(maxGradeNum)) ? maxGradeNum : null,
+    }];
     await updSub(selectedId, {grades:newGrades});
-    setNewGrade({v:"",w:"1",label:""});
+    setNewGrade({v:"",w:"1",label:"",classAvg:"",maxGrade:""});
   }
 
   async function deleteGrade(index) {
@@ -416,6 +444,37 @@ export default function App() {
         {/* DASHBOARD */}
         {tab==="dashboard"&&(
           <div>
+            {subjects.length>0&&(()=>{
+              const ranking = buildLossRanking(subjects);
+              return (
+                <div style={{background:S.surface,borderRadius:14,padding:14,marginBottom:16,border:`1px solid ${S.border}`}}>
+                  <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:10,fontFamily:"Syne,sans-serif"}}>OÙ TU PERDS LE PLUS DE POINTS</div>
+                  {ranking.length===0?(
+                    <div style={{fontSize:12,color:S.muted,fontStyle:"italic"}}>
+                      Aucune matière sous son objectif — soit t'es au-dessus partout 🎉, soit aucun objectif n'est encore fixé (onglet Plan).
+                    </div>
+                  ):(
+                    ranking.slice(0,5).map((r,i)=>(
+                      <div key={r.id} onClick={()=>{setSelectedId(r.id);setTab("subjects");}}
+                        style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderTop:i===0?"none":`1px solid ${S.border}`,cursor:"pointer"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+                          <span style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:13,color:S.muted,width:16,flexShrink:0}}>#{i+1}</span>
+                          <div style={{minWidth:0}}>
+                            <div style={{fontSize:13,fontWeight:600,fontFamily:"Syne,sans-serif",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name}</div>
+                            <div style={{fontSize:10,color:S.muted}}>{r.avg.toFixed(2)}/20 · objectif {r.obj} · coef {r.coef}</div>
+                          </div>
+                        </div>
+                        <div style={{textAlign:"right",flexShrink:0,marginLeft:8}}>
+                          <div style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:15,color:"#F87171"}}>-{r.weighted.toFixed(1)}</div>
+                          <div style={{fontSize:9,color:S.muted}}>pts pondérés</div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              );
+            })()}
+
             <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>TOUTES LES MATIÈRES</div>
             {subjects.length===0&&(
               <div style={{textAlign:"center",padding:"40px 20px",color:S.muted,fontSize:12,fontStyle:"italic"}}>
@@ -476,13 +535,21 @@ export default function App() {
                 <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,fontFamily:"Syne,sans-serif"}}>NOTES</div>
                 {(!selected.grades||selected.grades.length===0)&&<div style={{fontSize:12,color:S.muted,fontStyle:"italic",marginBottom:12}}>Aucune note pour l'instant.</div>}
                 {(selected.grades||[]).map((g,i)=>(
-                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:S.surface2,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
-                    <div>
-                      <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14}}>{g.v}/20</span>
-                      <span style={{fontSize:11,color:S.muted,marginLeft:8}}>coef {g.w}{g.label?` · ${g.label}`:""}</span>
+                  <div key={i} style={{background:S.surface2,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <div>
+                        <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14}}>{g.v}/20</span>
+                        <span style={{fontSize:11,color:S.muted,marginLeft:8}}>coef {g.w}{g.label?` · ${g.label}`:""}</span>
+                      </div>
+                      <button onClick={()=>deleteGrade(i)}
+                        style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:14}}>×</button>
                     </div>
-                    <button onClick={()=>deleteGrade(i)}
-                      style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:14}}>×</button>
+                    {(g.classAvg!=null||g.maxGrade!=null)&&(
+                      <div style={{display:"flex",gap:12,marginTop:4,fontSize:10,color:S.muted}}>
+                        {g.classAvg!=null&&<span>📊 Classe {g.classAvg}/20</span>}
+                        {g.maxGrade!=null&&<span>🏆 Meilleure {g.maxGrade}/20</span>}
+                      </div>
+                    )}
                   </div>
                 ))}
 
@@ -500,6 +567,42 @@ export default function App() {
                   <button onClick={addGrade}
                     style={{background:selected.color,border:"none",color:"#fff",borderRadius:8,padding:"8px 16px",fontSize:20,cursor:"pointer"}}>+</button>
                 </div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:8}}>
+                  <input type="number" placeholder="Moy. classe (optionnel)" min="0" max="20" step="0.1"
+                    value={newGrade.classAvg} onChange={e=>setNewGrade(g=>({...g,classAvg:e.target.value}))}
+                    style={{...inp(),flex:"1 1 140px"}} />
+                  <input type="number" placeholder="Meilleure note (optionnel)" min="0" max="20" step="0.1"
+                    value={newGrade.maxGrade} onChange={e=>setNewGrade(g=>({...g,maxGrade:e.target.value}))}
+                    style={{...inp(),flex:"1 1 140px"}} />
+                </div>
+
+                {selected.grades&&selected.grades.length>0&&(
+                  <div style={{marginTop:16}}>
+                    <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,fontFamily:"Syne,sans-serif"}}>COMPARAISON AVEC LA CLASSE</div>
+                    {selected.grades.some(g=>g.classAvg!=null||g.maxGrade!=null)?(
+                      <div style={{background:S.surface2,borderRadius:12,padding:12}}>
+                        <div style={{display:"flex",gap:14,marginBottom:8,fontSize:10,color:S.muted,flexWrap:"wrap"}}>
+                          <span style={{display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:4,background:selected.color,display:"inline-block"}}/>Moi</span>
+                          <span style={{display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:4,background:"#FBBF24",display:"inline-block"}}/>Moyenne classe</span>
+                          <span style={{display:"flex",alignItems:"center",gap:4}}><span style={{width:8,height:8,borderRadius:4,background:"#34D399",display:"inline-block"}}/>Meilleure note</span>
+                        </div>
+                        <ResponsiveContainer width="100%" height={200}>
+                          <LineChart data={buildSubjectCompareData(selected.grades)} margin={{top:5,right:10,left:-20,bottom:0}}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={S.border} />
+                            <XAxis dataKey="label" tick={{fill:S.muted,fontSize:9}} />
+                            <YAxis domain={[0,20]} tick={{fill:S.muted,fontSize:10}} />
+                            <Tooltip contentStyle={{background:S.bg,border:`1px solid ${S.border}`,borderRadius:8,fontSize:12}} labelStyle={{color:S.text}} />
+                            <Line type="monotone" dataKey="moi" name="Moi" stroke={selected.color} strokeWidth={2.5} dot={{r:3}} connectNulls />
+                            <Line type="monotone" dataKey="classe" name="Moyenne classe" stroke="#FBBF24" strokeWidth={2} dot={{r:3}} connectNulls />
+                            <Line type="monotone" dataKey="meilleure" name="Meilleure note" stroke="#34D399" strokeWidth={2} dot={{r:3}} connectNulls />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    ):(
+                      <div style={{fontSize:11,color:S.muted,fontStyle:"italic"}}>Renseigne la moyenne de classe et/ou la meilleure note sur au moins une évaluation pour voir le graphique de comparaison.</div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
