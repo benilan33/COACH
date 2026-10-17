@@ -572,24 +572,66 @@ export default function App() {
 
                 <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,fontFamily:"Syne,sans-serif"}}>NOTES</div>
                 {(!selected.grades||selected.grades.length===0)&&<div style={{fontSize:12,color:S.muted,fontStyle:"italic",marginBottom:12}}>Aucune note pour l'instant.</div>}
-                {(selected.grades||[]).map((g,i)=>(
-                  <div key={i} style={{background:S.surface2,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                      <div>
-                        <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14}}>{g.v}/20</span>
-                        <span style={{fontSize:11,color:S.muted,marginLeft:8}}>coef {g.w}{g.label?` · ${g.label}`:""}</span>
+                {(selected.grades||[]).map((g,i)=>{
+                  const isEditing = editing && editing.subId===selected.id && editing.idx===i;
+                  if (isEditing) {
+                    return (
+                      <div key={i} style={{background:S.surface2,borderRadius:8,padding:"10px 12px",marginBottom:6,border:`1px solid ${selected.color}60`}}>
+                        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:6}}>
+                          <input type="number" placeholder="Note /20" min="0" max="20" step="0.5"
+                            value={editDraft.v} onChange={e=>setEditDraft(d=>({...d,v:e.target.value}))}
+                            style={{...inp(),flex:"1 1 70px"}} />
+                          <input type="number" placeholder="Coef" min="0.25" step="0.25"
+                            value={editDraft.w} onChange={e=>setEditDraft(d=>({...d,w:e.target.value}))}
+                            style={{...inp(),flex:"1 1 60px"}} />
+                          <input type="date" value={editDraft.date}
+                            onChange={e=>setEditDraft(d=>({...d,date:e.target.value}))}
+                            style={{...inp(),flex:"1 1 130px"}} />
+                        </div>
+                        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>
+                          <input placeholder="Libellé" value={editDraft.label}
+                            onChange={e=>setEditDraft(d=>({...d,label:e.target.value}))}
+                            style={{...inp(),flex:"2 1 120px"}} />
+                          <input type="number" placeholder="Moy. classe" min="0" max="20" step="0.1"
+                            value={editDraft.classAvg} onChange={e=>setEditDraft(d=>({...d,classAvg:e.target.value}))}
+                            style={{...inp(),flex:"1 1 100px"}} />
+                          <input type="number" placeholder="Meilleure note" min="0" max="20" step="0.1"
+                            value={editDraft.maxGrade} onChange={e=>setEditDraft(d=>({...d,maxGrade:e.target.value}))}
+                            style={{...inp(),flex:"1 1 100px"}} />
+                        </div>
+                        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                          <button onClick={cancelEditGrade}
+                            style={{background:"none",border:`1px solid ${S.border}`,color:S.muted,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer"}}>Annuler</button>
+                          <button onClick={saveEditGrade}
+                            style={{background:selected.color,border:"none",color:"#fff",borderRadius:8,padding:"6px 14px",fontSize:12,cursor:"pointer",fontWeight:700,fontFamily:"Syne,sans-serif"}}>Enregistrer</button>
+                        </div>
                       </div>
-                      <button onClick={()=>deleteGrade(i)}
-                        style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:14}}>×</button>
+                    );
+                  }
+                  return (
+                    <div key={i} style={{background:S.surface2,borderRadius:8,padding:"8px 12px",marginBottom:6}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div>
+                          <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14}}>{g.v}/20</span>
+                          <span style={{fontSize:11,color:S.muted,marginLeft:8}}>coef {g.w}{g.label?` · ${g.label}`:""}</span>
+                          {g.date&&<span style={{fontSize:10,color:S.muted,marginLeft:8}}>· {g.date}</span>}
+                        </div>
+                        <div style={{display:"flex",gap:12,flexShrink:0,alignItems:"center"}}>
+                          <button onClick={()=>startEditGrade(selected.id,i,g)}
+                            style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:13}}>✏️</button>
+                          <button onClick={()=>deleteGrade(i)}
+                            style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:14}}>×</button>
+                        </div>
+                      </div>
+                      {(g.classAvg!=null||g.maxGrade!=null)&&(
+                        <div style={{display:"flex",gap:12,marginTop:4,fontSize:10,color:S.muted}}>
+                          {g.classAvg!=null&&<span>📊 Classe {g.classAvg}/20</span>}
+                          {g.maxGrade!=null&&<span>🏆 Meilleure {g.maxGrade}/20</span>}
+                        </div>
+                      )}
                     </div>
-                    {(g.classAvg!=null||g.maxGrade!=null)&&(
-                      <div style={{display:"flex",gap:12,marginTop:4,fontSize:10,color:S.muted}}>
-                        {g.classAvg!=null&&<span>📊 Classe {g.classAvg}/20</span>}
-                        {g.maxGrade!=null&&<span>🏆 Meilleure {g.maxGrade}/20</span>}
-                      </div>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
 
                 <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,marginTop:12,fontFamily:"Syne,sans-serif"}}>AJOUTER UNE NOTE</div>
                 <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
