@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { supabase } from "./supabaseClient";
 
@@ -69,6 +69,7 @@ const SCHEDULE_DATA = {
   Sam: [null,null,null,null,null,null,null,null],
 };
 
+// ======== Calculs de notes ========
 function calcAvg(grades) {
   if (!grades || !grades.length) return null;
   const tot = grades.reduce((s,g)=>s+g.v*g.w,0);
@@ -114,6 +115,29 @@ function gradeNeeded(grades, obj, noteWeight) {
   return (obj*(curW+noteWeight)-curTot)/noteWeight;
 }
 
+// ======== Dates (tout en heure LOCALE, jamais en UTC) ========
+const MOIS = ["janv.","févr.","mars","avr.","mai","juin","juil.","août","sept.","oct.","nov.","déc."];
+
+// "2026-10-26" d'après l'horloge locale (toISOString() donnerait la date UTC → veille entre 0h et 1h/2h)
+function todayLocal() {
+  const d = new Date();
+  const p = n => String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
+}
+// "2026-10-26" -> {y:2026, m:9 (0-11), d:26}, ou null si pas de date valide
+function parseDate(str) {
+  if (!str) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str);
+  if (!m) return null;
+  return { y:+m[1], m:+m[2]-1, d:+m[3] };
+}
+// Trimestres scolaires : T1 sept-nov, T2 déc-fév, T3 mars-août. startYear = année de la rentrée.
+function trimesterOf(y, m) {
+  const startYear = m >= 8 ? y : y-1;
+  const t = (m>=8 && m<=10) ? 1 : (m===11 || m<=1) ? 2 : 3;
+  return { t, startYear };
+}
+
 const S = { bg:"#0C0C10",surface:"#13131A",surface2:"#1C1C28",border:"#252535",text:"#F0EFF8",muted:"#6B6B85",accent:"#7C6DFA" };
 
 function inp(extra={}) {
@@ -121,7 +145,7 @@ function inp(extra={}) {
 }
 
 function buildSubjectCompareData(grades) {
-  const sorted = [...(grades||[])].sort((a,b)=>new Date(a.date)-new Date(b.date));
+  const sorted = [...(grades||[])].sort((a,b)=>(a.date||"").localeCompare(b.date||""));
   return sorted.map((g,i)=>({
     label: g.label || `Note ${i+1}`,
     moi: g.v,
@@ -130,50 +154,243 @@ function buildSubjectCompareData(grades) {
   }));
 }
 
+// Un point par période (jour / mois / trimestre) = la moyenne à la FIN de la période.
 function buildEvolutionData(subjects, granularity) {
-  const allGrades = [];
+  const all = [];
   subjects.forEach(s=>{
-    (s.grades||[]).forEach(g=>allGrades.push({...g, subjectId:s.id, coef:s.coef, color:s.color, subjectName:s.name}));
+    (s.grades||[]).forEach(g=>all.push({...g, subjectId:s.id}));
   });
-  allGrades.sort((a,b)=>new Date(a.date)-new Date(b.date));
-  if(!allGrades.length) return [];
+  all.sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+  if(!all.length) return [];
 
-  const points = [];
-  const runningGradesBySubject = {};
-  subjects.forEach(s=>runningGradesBySubject[s.id]=[]);
+  const running = {};
+  subjects.forEach(s=>running[s.id]=[]);
+  const buckets = new Map(); // garde l'ordre d'insertion ; re-set d'une clé = on garde la dernière valeur
 
-  allGrades.forEach(g=>{
-    runningGradesBySubject[g.subjectId].push(g);
+  all.forEach(g=>{
+    running[g.subjectId].push(g);
+    const dt = parseDate(g.date);
+    if(!dt) return; // note sans date : comptée dans les moyennes, mais pas de point sur l'axe
+
     let tot=0,w=0;
     subjects.forEach(s=>{
-      const a = calcAvg(runningGradesBySubject[s.id]);
+      const a = calcAvg(running[s.id]);
       if(a!==null){tot+=a*s.coef;w+=s.coef;}
     });
-    const avg = w?tot/w:null;
-    const d = new Date(g.date);
-    let label;
-    if(granularity==="mois") label = d.toLocaleDateString("fr-FR",{month:"short",year:"2-digit"});
-    else if(granularity==="trimestre") {
-      const month = d.getMonth();
-      const trim = month<=9&&month>=8?"T1":month<=11||month<=1?"T2":"T3";
-      label = `${trim} ${d.getFullYear()}`;
-    } else label = d.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"});
-    points.push({ label, avg: avg!==null?parseFloat(avg.toFixed(2)):null, date:g.date });
+    const avg = w ? tot/w : null;
+
+    let key, label;
+    if (granularity==="mois") {
+      key = `${dt.y}-${String(dt.m).padStart(2,"0")}`;
+      label = `${MOIS[dt.m]} ${String(dt.y).slice(2)}`;
+    } else if (granularity==="trimestre") {
+      const {t,startYear} = trimesterOf(dt.y, dt.m);
+      key = `${startYear}-T${t}`;
+      label = `T${t} ${String(startYear).slice(2)}-${String(startYear+1).slice(2)}`;
+    } else {
+      key = g.date.slice(0,10);
+      label = `${String(dt.d).padStart(2,"0")} ${MOIS[dt.m]}`;
+    }
+    buckets.set(key, { label, avg: avg!==null?parseFloat(avg.toFixed(2)):null, date:g.date });
   });
-  return points;
+  return Array.from(buckets.values());
+}
+
+// ======== Écart à la classe ========
+function fmtGap(x) { return (x>=0?"+":"")+x.toFixed(1); }
+function gapColor(x) { return x>=0?"#34D399":x>=-1?"#FBBF24":"#F87171"; }
+
+// Écart moyen (pondéré par le coef de chaque note) entre ta note et la moyenne de classe.
+// On ne garde que les notes où la moyenne de classe est renseignée.
+function subjectClassGap(grades) {
+  const g = (grades||[]).filter(x=>x.classAvg!=null);
+  if (!g.length) return null;
+  const w = g.reduce((s,x)=>s+x.w,0);
+  const gap = g.reduce((s,x)=>s+(x.v-x.classAvg)*x.w,0)/w;
+  const top = g.filter(x=>x.maxGrade!=null);
+  const wt = top.reduce((s,x)=>s+x.w,0);
+  const gapTop = wt ? top.reduce((s,x)=>s+(x.v-x.maxGrade)*x.w,0)/wt : null; // ≤ 0 : à quelle distance du meilleur
+  const above = g.filter(x=>x.v>x.classAvg).length;
+  return { gap, gapTop, above, n:g.length };
+}
+function globalClassGap(subjects) {
+  let tot=0,w=0;
+  subjects.forEach(s=>{ const r=subjectClassGap(s.grades); if(r){ tot+=r.gap*s.coef; w+=s.coef; } });
+  return w ? tot/w : null;
+}
+
+// ======== Tendance d'une matière ========
+// Moyenne des k dernières notes vs moyenne des k précédentes (k = 3 max). Il faut au moins 4 notes.
+function subjectTrend(grades) {
+  const sorted = [...(grades||[])].sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+  const n = sorted.length;
+  if (n < 4) return null;
+  const k = Math.min(3, Math.floor(n/2));
+  const recent = calcAvg(sorted.slice(n-k));
+  const before = calcAvg(sorted.slice(n-2*k, n-k));
+  return { delta: recent-before, recent, before, k };
+}
+
+// ======== Badges / XP / niveaux ========
+const TIER_COLORS = ["#CD7F32","#C0C0C0","#FBBF24"]; // bronze, argent, or
+const TIER_PTS = [10,25,50];
+const LEVELS = [
+  {xp:0,   emoji:"😴", title:"Seconde en roue libre"},
+  {xp:30,  emoji:"🏃", title:"Première en échauffement"},
+  {xp:80,  emoji:"📖", title:"Terminale en mode sérieux"},
+  {xp:150, emoji:"🧮", title:"Matheux confirmé"},
+  {xp:250, emoji:"🎓", title:"Candidat MP2I"},
+  {xp:350, emoji:"🚀", title:"Futur intégré"},
+  {xp:460, emoji:"👑", title:"Légende de Montaigne"},
+];
+const SEEN_KEY = "coach_badges_seen_v1";
+function loadSeen() { try { const r = localStorage.getItem(SEEN_KEY); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
+function saveSeen(levels) { try { localStorage.setItem(SEEN_KEY, JSON.stringify(levels)); } catch (e) { /* stockage indisponible : tant pis */ } }
+
+function fmtV(v) { return Number.isInteger(v) ? String(v) : v.toFixed(1); }
+// Numéro de semaine (lundi → dimanche) pour compter les semaines distinctes avec une note
+function weekIndex(dateStr) {
+  const d = parseDate(dateStr);
+  if (!d) return null;
+  return Math.floor((Date.UTC(d.y, d.m, d.d)/86400000 + 3) / 7);
+}
+
+// Tout est recalculé depuis l'historique des notes : aucune table à créer.
+function computeBadges(subjects, target) {
+  const all = [];
+  subjects.forEach(s=>(s.grades||[]).forEach(g=>all.push({...g, sid:s.id})));
+  all.sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+
+  const avg = genAvg(subjects);
+  const gGap = globalClassGap(subjects);
+
+  // plus longue série de notes d'affilée au-dessus de la moyenne de classe
+  let run=0, bestRun=0;
+  all.filter(g=>g.classAvg!=null).forEach(g=>{
+    if (g.v>g.classAvg) { run++; bestRun=Math.max(bestRun,run); } else run=0;
+  });
+  // plus gros bond d'une note à la suivante, dans une même matière
+  let bestJump=0;
+  subjects.forEach(s=>{
+    const gs=[...(s.grades||[])].sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+    for (let i=1;i<gs.length;i++) bestJump=Math.max(bestJump, gs[i].v-gs[i-1].v);
+  });
+
+  const bestGrade = all.length ? Math.max(...all.map(g=>g.v)) : 0;
+  const topCount = all.filter(g=>g.maxGrade!=null && g.v>=g.maxGrade).length;
+  const weeks = new Set(all.map(g=>weekIndex(g.date)).filter(w=>w!==null)).size;
+  const classFilled = all.filter(g=>g.classAvg!=null).length;
+  const subjAvgs = subjects.map(s=>calcAvg(s.grades)).filter(a=>a!==null);
+  const minAvg = subjAvgs.length>=3 ? Math.min(...subjAvgs) : 0;
+  const at16 = subjects.filter(s=>(s.grades||[]).some(g=>g.v>=16)).length;
+  const atObj = subjects.filter(s=>{ const a=calcAvg(s.grades); return a!==null && s.obj!=null && a>=s.obj; }).length;
+
+  const defs = [
+    {id:"collection", emoji:"📚", name:"Collectionneur", flavor:"Les notes, ça s'accumule.", value:all.length, tiers:[5,20,50],
+      goal:t=>`Enregistre ${t} notes`},
+    {id:"sniper", emoji:"🎯", name:"Sniper", flavor:"Droit dans le mille.", value:bestGrade, tiers:[16,18,20],
+      goal:t=>`Décroche une note d'au moins ${t}/20`},
+    {id:"serie", emoji:"🔥", name:"En feu", flavor:"Impossible à arrêter.", value:bestRun, tiers:[3,5,8],
+      goal:t=>`${t} notes d'affilée au-dessus de la moyenne de classe`},
+    {id:"remontada", emoji:"🚀", name:"Remontada", flavor:"Le bond que personne n'a vu venir.", value:bestJump, tiers:[3,5,8],
+      goal:t=>`Gagne ${t} pts d'une note à la suivante (même matière)`},
+    {id:"major", emoji:"👑", name:"Major", flavor:"Le haut du tableau, c'est chez toi.", value:topCount, tiers:[1,3,5],
+      goal:t=>`Égale la meilleure note de la classe (${t} fois)`},
+    {id:"melee", emoji:"🦅", name:"Au-dessus de la mêlée", flavor:"Tu voles plus haut que le reste.", value:gGap??0, tiers:[0.5,2,4], fmt:fmtGap,
+      goal:t=>`Écart moyen à la classe d'au moins ${fmtGap(t)} pt`},
+    {id:"altitude", emoji:"🏔️", name:"Altitude", flavor:"L'air est pur là-haut.", value:avg??0, tiers:[12,14,16], fmt:v=>v.toFixed(1),
+      goal:t=>`Moyenne générale d'au moins ${t}`},
+    {id:"cap", emoji:"🏆", name:"Cap tenu", flavor:"Promis, juré, fait.", value:avg??0, tiers:[target], fmt:v=>v.toFixed(1),
+      goal:t=>`Atteins ton objectif général (${fmtV(t)}/20)`},
+    {id:"mission", emoji:"🏁", name:"Mission accomplie", flavor:"Objectif coché, matière après matière.", value:atObj, tiers:[1,3,5],
+      goal:t=>`${t} matière${t>1?"s":""} à leur objectif`},
+    {id:"touche", emoji:"🧬", name:"Touche-à-tout", flavor:"Fort partout, ou presque.", value:at16, tiers:[2,4,6],
+      goal:t=>`Un 16+ dans ${t} matières différentes`},
+    {id:"metronome", emoji:"🗓️", name:"Métronome", flavor:"La régularité, ça paie.", value:weeks, tiers:[4,10,20],
+      goal:t=>`Des notes sur ${t} semaines différentes`},
+    {id:"plancher", emoji:"🧱", name:"Plancher solide", flavor:"Pas de maillon faible.", value:minAvg, tiers:[10,12,14], fmt:v=>v.toFixed(1),
+      goal:t=>`Aucune matière sous ${t} de moyenne (3 matières notées minimum)`},
+    {id:"nerd", emoji:"🤓", name:"Data nerd", flavor:"Tu mesures, donc tu progresses.", value:classFilled, tiers:[5,15,30],
+      goal:t=>`Renseigne la moyenne de classe sur ${t} notes`},
+  ];
+
+  let xp=0, unlockedTiers=0, totalTiers=0;
+  const badges = defs.map(d=>{
+    const level = d.tiers.filter(t=>d.value>=t).length;
+    const next = level < d.tiers.length ? d.tiers[level] : null;
+    const pts = d.tiers.length===1 ? [50] : TIER_PTS;
+    for (let i=0;i<level;i++) xp += pts[i];
+    unlockedTiers += level;
+    totalTiers += d.tiers.length;
+    const progress = next===null ? 1 : Math.max(0, Math.min(1, d.value/next));
+    return { ...d, fmt: d.fmt || fmtV, level, next, progress, colors: d.tiers.length===1 ? [TIER_COLORS[2]] : TIER_COLORS };
+  });
+
+  const trends = subjects
+    .map(s=>{ const t=subjectTrend(s.grades); return t ? {id:s.id, name:s.name, color:s.color, ...t} : null; })
+    .filter(Boolean)
+    .sort((a,b)=>b.delta-a.delta);
+
+  let levelIdx = 0;
+  LEVELS.forEach((l,i)=>{ if (xp>=l.xp) levelIdx=i; });
+
+  return { badges, xp, levelIdx, unlockedTiers, totalTiers, trends };
 }
 
 export default function App() {
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
   const [target, setTarget] = useState(15);
+  const [targetDraft, setTargetDraft] = useState("15"); // ce qui est tapé dans le champ (peut être vide un instant)
 
-  async function updateTarget(value) {
-    const v = parseFloat(value) || 15;
-    setTarget(v);
-    const { error } = await supabase.from('settings').upsert({id:1, target:v});
-    if (error) console.error('updateTarget:', error);
+  // ---- Écritures Supabase "différées" (debounce) : évite 1 requête par lettre tapée ----
+  const pendingSub = useRef({});      // { [id]: {id, patch, timer} }
+  const pendingTarget = useRef({ value:null, timer:null });
+
+  function flushSub(id) {
+    const p = pendingSub.current[id];
+    if (!p) return;
+    clearTimeout(p.timer);
+    delete pendingSub.current[id];
+    supabase.from('subjects').update(p.patch).eq('id', id).then(({error}) => {
+      if (error) console.error('updSub:', error);
+    });
   }
+  function flushTarget() {
+    const p = pendingTarget.current;
+    if (p.value === null) return;
+    clearTimeout(p.timer);
+    const v = p.value;
+    p.value = null;
+    supabase.from('settings').upsert({id:1, target:v}).then(({error}) => {
+      if (error) console.error('updateTarget:', error);
+    });
+  }
+
+  // Si l'onglet passe en arrière-plan / se ferme, on envoie tout de suite ce qui est en attente
+  useEffect(() => {
+    function onHide() {
+      if (document.visibilityState === "hidden") {
+        Object.values(pendingSub.current).forEach(p => flushSub(p.id));
+        flushTarget();
+      }
+    }
+    document.addEventListener("visibilitychange", onHide);
+    return () => document.removeEventListener("visibilitychange", onHide);
+  }, []);
+
+  function onTargetChange(value) {
+    setTargetDraft(value);
+    const v = parseFloat(value);
+    if (isNaN(v) || v <= 0 || v > 20) return; // champ vide ou invalide : on attend, on ne touche à rien
+    setTarget(v);
+    const p = pendingTarget.current;
+    p.value = v;
+    clearTimeout(p.timer);
+    p.timer = setTimeout(flushTarget, 600);
+  }
+
   const [tab, setTab] = useState("dashboard");
   const [selectedId, setSelectedId] = useState(null);
   const [newGrade, setNewGrade] = useState({v:"",w:"1",label:"",classAvg:"",maxGrade:""});
@@ -186,25 +403,26 @@ export default function App() {
   const [evoSubject, setEvoSubject] = useState("global");
   const [tasks, setTasks] = useState([]);
   const [newTask, setNewTask] = useState("");
-  const [schedule, setSchedule] = useState({});
   const [persoTab, setPersoTab] = useState("dossiers");
   const [folders, setFolders] = useState([]);
   const [newFolderName, setNewFolderName] = useState("");
   const [selectedFolder, setSelectedFolder] = useState(null);
 
   // ---- Chargement initial depuis Supabase ----
-  useEffect(() => {
-    async function fetchAll() {
+  async function fetchAll() {
+    setLoadError(false);
+    let failed = false;
+    try {
       const { data: subjectsData, error: e1 } = await supabase.from('subjects').select('*').order('id');
-      if (e1) console.error('subjects:', e1); else setSubjects(subjectsData || []);
+      if (e1) { console.error('subjects:', e1); failed = true; } else setSubjects(subjectsData || []);
 
       const { data: tasksData, error: e2 } = await supabase.from('tasks').select('*').order('id');
-      if (e2) console.error('tasks:', e2); else setTasks(tasksData || []);
+      if (e2) { console.error('tasks:', e2); failed = true; } else setTasks(tasksData || []);
 
       const { data: foldersData, error: e3 } = await supabase.from('folders').select('*').order('id');
       const { data: filesData, error: e4 } = await supabase.from('files').select('*').order('id');
-      if (e3) console.error('folders:', e3);
-      if (e4) console.error('files:', e4);
+      if (e3) { console.error('folders:', e3); failed = true; }
+      if (e4) { console.error('files:', e4); failed = true; }
       if (foldersData) {
         setFolders(foldersData.map(f => ({
           ...f,
@@ -213,13 +431,21 @@ export default function App() {
       }
 
       const { data: settingsData, error: e5 } = await supabase.from('settings').select('*').eq('id', 1).single();
-      if (e5) console.error('settings:', e5);
-      else if (settingsData) setTarget(settingsData.target ?? 15);
-
+      if (e5) { console.error('settings:', e5); failed = true; }
+      else if (settingsData) {
+        const t = settingsData.target ?? 15;
+        setTarget(t);
+        setTargetDraft(String(t));
+      }
+    } catch (err) {
+      console.error('fetchAll:', err);
+      failed = true;
+    } finally {
+      setLoadError(failed);
       setLoading(false);
     }
-    fetchAll();
-  }, []);
+  }
+  useEffect(() => { fetchAll(); }, []);
 
   const avg = genAvg(subjects);
   const avgColor = avg===null?S.muted:avg>=target?"#34D399":avg>=target-1?"#FBBF24":"#F87171";
@@ -227,29 +453,34 @@ export default function App() {
   const selected = subjects.find(s=>s.id===selectedId);
 
   // ---- Matières / notes ----
-  async function updSub(id, patch) {
+  // Mise à jour immédiate à l'écran ; écriture Supabase différée de 600 ms (ou tout de suite avec {immediate:true})
+  function updSub(id, patch, { immediate=false } = {}) {
     setSubjects(p => p.map(s => s.id === id ? {...s, ...patch} : s));
-    const { error } = await supabase.from('subjects').update(patch).eq('id', id);
-    if (error) console.error('updSub:', error);
+    const p = pendingSub.current[id] || { id, patch:{}, timer:null };
+    p.patch = {...p.patch, ...patch};
+    clearTimeout(p.timer);
+    pendingSub.current[id] = p;
+    if (immediate) flushSub(id);
+    else p.timer = setTimeout(() => flushSub(id), 600);
   }
 
-  async function addGrade() {
+  function addGrade() {
     const v = parseFloat(newGrade.v), w = parseFloat(newGrade.w) || 1;
     if (isNaN(v) || v < 0 || v > 20 || !selectedId) return;
     const classAvgNum = newGrade.classAvg !== "" ? parseFloat(newGrade.classAvg) : null;
     const maxGradeNum = newGrade.maxGrade !== "" ? parseFloat(newGrade.maxGrade) : null;
     const newGrades = [...(selected.grades||[]), {
-      v, w, label:newGrade.label, date:new Date().toISOString().slice(0,10),
+      v, w, label:newGrade.label, date:todayLocal(),
       classAvg: (classAvgNum!==null && !isNaN(classAvgNum)) ? classAvgNum : null,
       maxGrade: (maxGradeNum!==null && !isNaN(maxGradeNum)) ? maxGradeNum : null,
     }];
-    await updSub(selectedId, {grades:newGrades});
+    updSub(selectedId, {grades:newGrades}, {immediate:true});
     setNewGrade({v:"",w:"1",label:"",classAvg:"",maxGrade:""});
   }
 
-  async function deleteGrade(index) {
+  function deleteGrade(index) {
     const newGrades = selected.grades.filter((_,j)=>j!==index);
-    await updSub(selected.id, {grades:newGrades});
+    updSub(selected.id, {grades:newGrades}, {immediate:true});
   }
 
   function startEditGrade(subId, idx, g) {
@@ -258,7 +489,7 @@ export default function App() {
       v: String(g.v ?? ""),
       w: String(g.w ?? "1"),
       label: g.label ?? "",
-      date: g.date || new Date().toISOString().slice(0,10),
+      date: g.date || todayLocal(),
       classAvg: g.classAvg!=null ? String(g.classAvg) : "",
       maxGrade: g.maxGrade!=null ? String(g.maxGrade) : "",
     });
@@ -269,7 +500,7 @@ export default function App() {
     setEditDraft(null);
   }
 
-  async function saveEditGrade() {
+  function saveEditGrade() {
     if (!editing || !editDraft) return;
     const v = parseFloat(editDraft.v), w = parseFloat(editDraft.w) || 1;
     if (isNaN(v) || v < 0 || v > 20) return;
@@ -283,7 +514,7 @@ export default function App() {
       classAvg: (classAvgNum!==null && !isNaN(classAvgNum)) ? classAvgNum : null,
       maxGrade: (maxGradeNum!==null && !isNaN(maxGradeNum)) ? maxGradeNum : null,
     } : g);
-    await updSub(editing.subId, {grades:newGrades});
+    updSub(editing.subId, {grades:newGrades}, {immediate:true});
     setEditing(null);
     setEditDraft(null);
   }
@@ -301,15 +532,18 @@ export default function App() {
   }
 
   async function deleteSubject(id) {
+    // on annule une éventuelle écriture en attente pour cette matière
+    const pend = pendingSub.current[id];
+    if (pend) { clearTimeout(pend.timer); delete pendingSub.current[id]; }
     setSubjects(p => p.filter(x => x.id !== id));
     setSelectedId(null);
     const { error } = await supabase.from('subjects').delete().eq('id', id);
     if (error) console.error('deleteSubject:', error);
   }
 
-  async function setObj(id, val) {
+  function setObj(id, val) {
     const v = val === "" ? null : parseFloat(val);
-    await updSub(id, {obj: isNaN(v) ? null : v});
+    updSub(id, {obj: isNaN(v) ? null : v});
   }
 
   // ---- Tâches ----
@@ -340,17 +574,6 @@ export default function App() {
     setTasks(p => p.map(t => t.id===id ? {...t, alarm:value} : t));
     const { error } = await supabase.from('tasks').update({alarm: value || null}).eq('id', id);
     if (error) console.error('setTaskAlarm:', error);
-  }
-
-  // ---- Emploi du temps ----
-  async function setScheduleSlot(day, slot, week, value) {
-    const key = `${day}_${slot}`;
-    const current = schedule[key] || {a:"", b:""};
-    const updated = {...current, [week]: value};
-    setSchedule(p => ({...p, [key]: updated}));
-    const { error } = await supabase.from('schedule')
-      .upsert({day, slot, content_a:updated.a, content_b:updated.b}, {onConflict:'day,slot'});
-    if (error) console.error('setScheduleSlot:', error);
   }
 
   // ---- Dossiers / fichiers ----
@@ -411,8 +634,33 @@ export default function App() {
     return buildEvolutionData([sub], granularity);
   }, [subjects, granularity, evoSubject]);
 
-  const TABS=[["dashboard","📊"],["subjects","📚"],["plan","🎯"],["evolution","📈"],["perso","📁"]];
-  const TAB_LABELS={"dashboard":"Dashboard","subjects":"Matières","plan":"Plan","evolution":"Évolution","perso":"Perso"};
+  // ---- Badges : tout est recalculé depuis les notes ; seul "ce que tu as déjà vu" est gardé dans le navigateur ----
+  const badgeData = useMemo(()=>computeBadges(subjects, target), [subjects, target]);
+  const levelsNow = useMemo(()=>Object.fromEntries(badgeData.badges.map(b=>[b.id, b.level])), [badgeData]);
+  const seenRef = useRef(null);            // niveaux déjà vus par toi (null = pas encore chargé)
+  const [, setSeenVersion] = useState(0);  // sert juste à forcer un re-rendu quand seenRef change
+
+  // 1er lancement : on enregistre l'état actuel pour ne pas tout marquer "NOUVEAU"
+  useEffect(() => {
+    if (loading || loadError || seenRef.current !== null) return;
+    const stored = loadSeen();
+    if (stored === null) { saveSeen(levelsNow); seenRef.current = levelsNow; }
+    else seenRef.current = stored;
+    setSeenVersion(v => v+1);
+  }, [loading, loadError]);
+
+  // Quand tu quittes l'onglet Badges, ce que tu viens de voir passe en "déjà vu"
+  useEffect(() => {
+    if (tab !== "badges" || loading) return;
+    const snapshot = levelsNow;
+    return () => { seenRef.current = snapshot; saveSeen(snapshot); setSeenVersion(v => v+1); };
+  }, [tab, loading, levelsNow]);
+
+  const isNewBadge = b => seenRef.current !== null && b.level > (seenRef.current[b.id] ?? 0);
+  const newBadgeCount = badgeData.badges.filter(isNewBadge).length;
+
+  const TABS=[["dashboard","📊"],["subjects","📚"],["plan","🎯"],["evolution","📈"],["badges","🏅"],["perso","📁"]];
+  const TAB_LABELS={"dashboard":"Dashboard","subjects":"Matières","plan":"Plan","evolution":"Évolution","badges":"Badges","perso":"Perso"};
 
   if (loading) {
     return (
@@ -429,9 +677,12 @@ export default function App() {
         *{box-sizing:border-box;margin:0;padding:0}
         ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#252535;border-radius:2px}
         input[type=number]::-webkit-inner-spin-button{opacity:0.3}
+        @keyframes badgePop{0%{transform:scale(.85);opacity:0}60%{transform:scale(1.04);opacity:1}100%{transform:scale(1);opacity:1}}
+        @keyframes badgeGlow{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 16px 2px var(--gc)}}
       `}</style>
 
-      <div style={{background:"linear-gradient(160deg,#16152A 0%,#0C0C10 100%)",borderBottom:`1px solid ${S.border}`,padding:"28px 20px 20px",textAlign:"center",position:"sticky",top:0,zIndex:100}}>
+      {/* Le header défile normalement (plus de sticky) : seule la barre d'onglets reste collée en haut */}
+      <div style={{background:"linear-gradient(160deg,#16152A 0%,#0C0C10 100%)",borderBottom:`1px solid ${S.border}`,padding:"28px 20px 20px",textAlign:"center"}}>
         <div style={{fontSize:11,color:S.accent,letterSpacing:4,marginBottom:10,fontFamily:"Syne,sans-serif",fontWeight:700}}>
           TERMINALE — ANNÉE 2026-2027
         </div>
@@ -444,8 +695,9 @@ export default function App() {
         </div>
         <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,marginTop:14}}>
           <span style={{fontSize:12,color:S.muted,fontFamily:"Syne,sans-serif",letterSpacing:2}}>OBJECTIF</span>
-          <input type="number" min="0" max="20" step="0.5" value={target}
-            onChange={e=>updateTarget(e.target.value)}
+          <input type="number" min="0" max="20" step="0.5" value={targetDraft}
+            onChange={e=>onTargetChange(e.target.value)}
+            onBlur={()=>setTargetDraft(String(target))}
             style={{...inp(),width:64,fontSize:18,textAlign:"center",fontFamily:"Syne,sans-serif",fontWeight:700,padding:"6px 10px",background:S.surface2}} />
           <span style={{fontSize:14,color:S.muted}}>/20</span>
         </div>
@@ -462,7 +714,7 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{display:"flex",borderBottom:`1px solid ${S.border}`,background:S.bg,position:"sticky",top:0,zIndex:99}}>
+      <div style={{display:"flex",borderBottom:`1px solid ${S.border}`,background:S.bg,position:"sticky",top:0,zIndex:100}}>
         {TABS.map(([t,icon])=>(
           <button key={t} onClick={()=>setTab(t)} style={{
             flex:1,padding:"11px 2px",background:"none",border:"none",
@@ -471,13 +723,32 @@ export default function App() {
             fontFamily:"Syne,sans-serif",fontWeight:700,letterSpacing:1,transition:"all 0.2s",
             display:"flex",flexDirection:"column",alignItems:"center",gap:2
           }}>
-            <span style={{fontSize:16}}>{icon}</span>
+            <span style={{fontSize:16,position:"relative"}}>
+              {icon}
+              {t==="badges"&&newBadgeCount>0&&(
+                <span style={{position:"absolute",top:-3,right:-7,minWidth:12,height:12,borderRadius:6,background:"#F472B6",color:"#fff",fontSize:8,
+                  fontFamily:"Syne,sans-serif",fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px"}}>{newBadgeCount}</span>
+              )}
+            </span>
             <span>{TAB_LABELS[t]}</span>
           </button>
         ))}
       </div>
 
       <div style={{padding:16,paddingBottom:80}}>
+
+        {loadError&&(
+          <div style={{background:"#F8717118",border:"1px solid #F8717160",borderRadius:12,padding:12,marginBottom:16,fontSize:12,lineHeight:1.6}}>
+            <div style={{fontFamily:"Syne,sans-serif",fontWeight:700,color:"#F87171",marginBottom:4}}>⚠️ Impossible de tout charger depuis Supabase</div>
+            <div style={{color:S.muted}}>
+              Projet en pause (tier gratuit, ~7 jours d'inactivité) ? Va sur supabase.com → ton projet → « Resume project », attends 1-5 min, puis réessaie.
+            </div>
+            <button onClick={()=>{setLoading(true);fetchAll();}}
+              style={{marginTop:8,background:S.accent,border:"none",color:"#fff",borderRadius:8,padding:"6px 14px",fontSize:12,cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:700}}>
+              Réessayer
+            </button>
+          </div>
+        )}
 
         {/* DASHBOARD */}
         {tab==="dashboard"&&(
@@ -513,6 +784,57 @@ export default function App() {
               );
             })()}
 
+            {subjects.length>0&&(()=>{
+              const rows = subjects
+                .map(s=>{ const r=subjectClassGap(s.grades); return r?{id:s.id,name:s.name,...r}:null; })
+                .filter(Boolean)
+                .sort((a,b)=>b.gap-a.gap);
+              const total = subjects.reduce((n,s)=>n+(s.grades||[]).length,0);
+              const filled = rows.reduce((n,r)=>n+r.n,0);
+              const gg = globalClassGap(subjects);
+              const maxAbs = Math.max(3,...rows.map(r=>Math.abs(r.gap)));
+              return (
+                <div style={{background:S.surface,borderRadius:14,padding:14,marginBottom:16,border:`1px solid ${S.border}`}}>
+                  <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:10,fontFamily:"Syne,sans-serif"}}>TON ÉCART À LA CLASSE</div>
+                  {rows.length===0?(
+                    <div style={{fontSize:12,color:S.muted,fontStyle:"italic",lineHeight:1.6}}>
+                      Renseigne la moyenne de classe sur tes notes (onglet Matières → fiche d'une matière → « Moy. classe ») pour voir ta position réelle. Un 14 dans une classe à 8, ce n'est pas un 14 dans une classe à 13 ! 😉
+                    </div>
+                  ):(
+                    <>
+                      <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:4}}>
+                        <span style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:30,color:gapColor(gg)}}>{fmtGap(gg)}</span>
+                        <span style={{fontSize:12,color:S.muted}}>pts vs la moyenne de classe</span>
+                      </div>
+                      <div style={{fontSize:10,color:S.muted,marginBottom:6}}>
+                        Pondéré par les coefs · basé sur {filled} note{filled!==1?"s":""} sur {total}
+                      </div>
+                      {rows.map((r,i)=>{
+                        const half = Math.min(50, Math.abs(r.gap)/maxAbs*50);
+                        return (
+                          <div key={r.id} onClick={()=>{setSelectedId(r.id);setTab("subjects");}}
+                            style={{padding:"8px 0",borderTop:`1px solid ${S.border}`,cursor:"pointer"}}>
+                            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:5,gap:8}}>
+                              <span style={{fontSize:12,fontWeight:600,fontFamily:"Syne,sans-serif",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name}</span>
+                              <span style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:14,color:gapColor(r.gap),flexShrink:0}}>{fmtGap(r.gap)}</span>
+                            </div>
+                            <div style={{position:"relative",height:6,background:S.surface2,borderRadius:3}}>
+                              <div style={{position:"absolute",left:"50%",top:-2,bottom:-2,width:1,background:S.muted,opacity:0.5}} />
+                              <div style={{position:"absolute",top:0,height:"100%",borderRadius:3,background:gapColor(r.gap),
+                                width:`${half}%`,left:r.gap>=0?"50%":`${50-half}%`,transition:"all 0.5s"}} />
+                            </div>
+                            <div style={{fontSize:9,color:S.muted,marginTop:4}}>
+                              {r.above}/{r.n} note{r.n!==1?"s":""} au-dessus de la classe{r.gapTop!=null?` · ${fmtGap(r.gapTop)} vs la meilleure note`:""}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </>
+                  )}
+                </div>
+              );
+            })()}
+
             <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:12,fontFamily:"Syne,sans-serif"}}>TOUTES LES MATIÈRES</div>
             {subjects.length===0&&(
               <div style={{textAlign:"center",padding:"40px 20px",color:S.muted,fontSize:12,fontStyle:"italic"}}>
@@ -539,7 +861,10 @@ export default function App() {
                     <div style={{height:"100%",borderRadius:3,width:`${a!==null?(a/20)*100:0}%`,background:`linear-gradient(90deg,${s.color}60,${s.color})`,transition:"width 0.5s"}} />
                   </div>
                   <div style={{display:"flex",justifyContent:"space-between",marginTop:6,fontSize:10,color:S.muted}}>
-                    <span>{(s.grades||[]).length} note{(s.grades||[]).length!==1?"s":""}</span>
+                    <span>
+                      {(s.grades||[]).length} note{(s.grades||[]).length!==1?"s":""}
+                      {(()=>{ const sg=subjectClassGap(s.grades); return sg?<span style={{color:gapColor(sg.gap),marginLeft:8}}>{fmtGap(sg.gap)} vs classe</span>:null; })()}
+                    </span>
                     <span>{(s.obj!==null&&s.obj!==undefined)?`Objectif ${s.obj}/20 ${icon}`:"Pas d'objectif fixé"}</span>
                   </div>
                 </div>
@@ -659,6 +984,18 @@ export default function App() {
                 {selected.grades&&selected.grades.length>0&&(
                   <div style={{marginTop:16}}>
                     <div style={{fontSize:10,color:S.muted,letterSpacing:3,marginBottom:8,fontFamily:"Syne,sans-serif"}}>COMPARAISON AVEC LA CLASSE</div>
+                    {(()=>{
+                      const sg = subjectClassGap(selected.grades);
+                      if (!sg) return null;
+                      const chip = {background:S.surface2,borderRadius:8,padding:"6px 10px",fontSize:11,color:S.muted};
+                      return (
+                        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}}>
+                          <span style={chip}>📊 Écart moyen : <b style={{color:gapColor(sg.gap),fontFamily:"Syne,sans-serif"}}>{fmtGap(sg.gap)} pts</b></span>
+                          <span style={chip}>✅ Au-dessus de la classe : <b style={{color:S.text,fontFamily:"Syne,sans-serif"}}>{sg.above}/{sg.n}</b></span>
+                          {sg.gapTop!=null&&<span style={chip}>🏆 vs meilleure note : <b style={{color:S.text,fontFamily:"Syne,sans-serif"}}>{fmtGap(sg.gapTop)} pts</b></span>}
+                        </div>
+                      );
+                    })()}
                     {selected.grades.some(g=>g.classAvg!=null||g.maxGrade!=null)?(
                       <div style={{background:S.surface2,borderRadius:12,padding:12}}>
                         <div style={{display:"flex",gap:14,marginBottom:8,fontSize:10,color:S.muted,flexWrap:"wrap"}}>
@@ -847,6 +1184,114 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* BADGES */}
+        {tab==="badges"&&(()=>{
+          const { badges, xp, levelIdx, unlockedTiers, totalTiers, trends } = badgeData;
+          const lv = LEVELS[levelIdx];
+          const nextLv = LEVELS[levelIdx+1];
+          const star = trends.length>0 && trends[0].delta>0 ? trends[0] : null;
+          const others = trends.slice(star?1:0);
+          const label = {fontSize:10,color:S.muted,letterSpacing:3,marginBottom:10,fontFamily:"Syne,sans-serif"};
+          return (
+            <div>
+              {/* Niveau + XP */}
+              <div style={{background:"linear-gradient(135deg,#1E1A4A 0%,#13131A 100%)",border:`1px solid ${S.accent}50`,borderRadius:16,padding:18,marginBottom:16,textAlign:"center"}}>
+                <div style={{fontSize:46,lineHeight:1,marginBottom:8}}>{lv.emoji}</div>
+                <div style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:18}}>{lv.title}</div>
+                <div style={{fontSize:11,color:S.muted,marginTop:4}}>{xp} XP · {unlockedTiers}/{totalTiers} paliers débloqués</div>
+                {nextLv?(
+                  <div style={{margin:"12px auto 0",maxWidth:300}}>
+                    <div style={{background:S.surface2,borderRadius:4,height:6,overflow:"hidden"}}>
+                      <div style={{height:"100%",borderRadius:4,width:`${Math.min(100,((xp-lv.xp)/(nextLv.xp-lv.xp))*100)}%`,
+                        background:`linear-gradient(90deg,${S.accent},#F472B6)`,transition:"width 0.7s"}} />
+                    </div>
+                    <div style={{fontSize:10,color:S.muted,marginTop:5}}>Prochain niveau : {nextLv.emoji} {nextLv.title} — encore {nextLv.xp-xp} XP</div>
+                  </div>
+                ):(
+                  <div style={{fontSize:11,color:"#FBBF24",marginTop:10}}>Niveau max atteint, respect ! 👑</div>
+                )}
+              </div>
+
+              {/* Badge du moment : meilleure progression */}
+              <div style={label}>BADGE DU MOMENT</div>
+              <div style={{background:S.surface,borderRadius:14,padding:14,marginBottom:16,border:`1px solid ${star?star.color+"50":S.border}`}}>
+                {star?(
+                  <div style={{display:"flex",alignItems:"center",gap:12}}>
+                    <div style={{fontSize:34}}>📈</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontSize:9,color:S.muted,letterSpacing:2,fontFamily:"Syne,sans-serif"}}>MEILLEURE PROGRESSION</div>
+                      <div style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:15,color:star.color,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{star.name}</div>
+                      <div style={{fontSize:10,color:S.muted,lineHeight:1.5}}>
+                        {star.before.toFixed(1)} → {star.recent.toFixed(1)} · moyenne des {star.k} dernières notes vs les {star.k} d'avant
+                      </div>
+                    </div>
+                    <div style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:22,color:"#34D399",flexShrink:0}}>{fmtGap(star.delta)}</div>
+                  </div>
+                ):(
+                  <div style={{fontSize:12,color:S.muted,fontStyle:"italic",lineHeight:1.6}}>
+                    Pas encore de progression à fêter : il faut au moins 4 notes dans une matière, et que la courbe monte. 😏
+                  </div>
+                )}
+                {others.length>0&&(
+                  <div style={{marginTop:star?12:10,paddingTop:8,borderTop:`1px solid ${S.border}`}}>
+                    {others.map(t=>(
+                      <div key={t.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"3px 0",fontSize:11}}>
+                        <span style={{color:S.muted,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.name}</span>
+                        <span style={{fontFamily:"Syne,sans-serif",fontWeight:700,flexShrink:0,marginLeft:8,
+                          color:t.delta>0.05?"#34D399":t.delta<-0.05?"#F87171":S.muted}}>
+                          {t.delta>0.05?"▲":t.delta<-0.05?"▼":"▬"} {fmtGap(t.delta)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Grille de badges */}
+              <div style={label}>TES BADGES</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:10}}>
+                {badges.map((b,i)=>{
+                  const isNew = isNewBadge(b);
+                  const col = b.level>0 ? b.colors[b.level-1] : S.border;
+                  return (
+                    <div key={b.id} style={{
+                      position:"relative",background:S.surface,borderRadius:14,padding:12,
+                      border:`1px solid ${b.level>0?col+"80":S.border}`,
+                      animation:`badgePop 0.45s ease ${i*0.04}s both${isNew?", badgeGlow 1.8s ease-in-out infinite":""}`,
+                      "--gc":col+"90"
+                    }}>
+                      {isNew&&(
+                        <div style={{position:"absolute",top:-7,right:8,background:"#F472B6",color:"#fff",fontSize:8,fontFamily:"Syne,sans-serif",
+                          fontWeight:800,letterSpacing:1,padding:"2px 6px",borderRadius:6}}>NOUVEAU ✨</div>
+                      )}
+                      <div style={{fontSize:32,lineHeight:1,filter:b.level>0?"none":"grayscale(1)",opacity:b.level>0?1:0.4}}>{b.emoji}</div>
+                      <div style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:12,marginTop:6}}>{b.name}</div>
+                      <div style={{display:"flex",gap:4,margin:"6px 0"}}>
+                        {b.tiers.map((t,j)=>(
+                          <span key={j} style={{width:8,height:8,borderRadius:4,
+                            background:j<b.level?b.colors[j]:S.surface2,border:`1px solid ${j<b.level?b.colors[j]:S.border}`}} />
+                        ))}
+                      </div>
+                      {b.level>0&&<div style={{fontSize:10,color:col,fontStyle:"italic",marginBottom:4}}>{b.flavor}</div>}
+                      {b.next!==null?(
+                        <>
+                          <div style={{fontSize:10,color:S.muted,lineHeight:1.4,marginBottom:6}}>{b.goal(b.next)}</div>
+                          <div style={{background:S.surface2,borderRadius:3,height:4,overflow:"hidden"}}>
+                            <div style={{height:"100%",borderRadius:3,width:`${b.progress*100}%`,background:b.colors[b.level],transition:"width 0.6s"}} />
+                          </div>
+                          <div style={{fontSize:9,color:S.muted,marginTop:3,textAlign:"right"}}>{b.fmt(b.value)} / {b.fmt(b.next)}</div>
+                        </>
+                      ):(
+                        <div style={{fontSize:10,color:"#FBBF24",fontFamily:"Syne,sans-serif",fontWeight:700}}>Palier max ✨</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* PERSO */}
         {tab==="perso"&&(
