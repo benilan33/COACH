@@ -1273,6 +1273,9 @@ export default function App() {
                             background:j<b.level?b.colors[j]:S.surface2,border:`1px solid ${j<b.level?b.colors[j]:S.border}`}} />
                         ))}
                       </div>
+                      {b.tiers.length>1&&(
+                        <div style={{fontSize:9,color:S.muted,marginBottom:6}}>Paliers : {b.tiers.map(t=>b.fmt(t)).join(" · ")}</div>
+                      )}
                       {b.level>0&&<div style={{fontSize:10,color:col,fontStyle:"italic",marginBottom:4}}>{b.flavor}</div>}
                       {b.next!==null?(
                         <>
@@ -1283,7 +1286,10 @@ export default function App() {
                           <div style={{fontSize:9,color:S.muted,marginTop:3,textAlign:"right"}}>{b.fmt(b.value)} / {b.fmt(b.next)}</div>
                         </>
                       ):(
-                        <div style={{fontSize:10,color:"#FBBF24",fontFamily:"Syne,sans-serif",fontWeight:700}}>Palier max ✨</div>
+                        <>
+                          <div style={{fontSize:10,color:S.muted,lineHeight:1.4,marginBottom:6}}>✅ {b.goal(b.tiers[b.tiers.length-1])}</div>
+                          <div style={{fontSize:10,color:"#FBBF24",fontFamily:"Syne,sans-serif",fontWeight:700}}>Palier max ✨ · actuel : {b.fmt(b.value)}</div>
+                        </>
                       )}
                     </div>
                   );
