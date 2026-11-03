@@ -337,6 +337,42 @@ function computeBadges(subjects, target) {
   return { badges, xp, levelIdx, unlockedTiers, totalTiers, trends };
 }
 
+// ======== Carnet d'erreurs : répétition espacée (méthode de Leitner) ========
+// Écart (en jours) avant la prochaine révision, selon le nombre de réussites d'affilée (= la "boîte").
+// 0 réussite (erreur neuve ou ratée) → demain, puis 2 j, 4 j, 7 j, 16 j.
+// Cumulé, ça fait J+1, J+3, J+7, J+14, J+30 si tu révises pile à l'heure.
+const GAPS = [1, 2, 4, 7, 16];
+const MAX_BOX = GAPS.length; // 5 réussites d'affilée = erreur maîtrisée
+const EMPTY_MISTAKE = { subject_id:"", chapter:"", question:"", pitfall:"", answer:"", now:false };
+
+// "2026-11-03" + n jours → "2026-11-05" (heure locale ; new Date(y, m, d+n) gère les fins de mois)
+function addDays(dateStr, n) {
+  const d = parseDate(dateStr);
+  const x = new Date(d.y, d.m, d.d + n);
+  const p = v => String(v).padStart(2,"0");
+  return `${x.getFullYear()}-${p(x.getMonth()+1)}-${p(x.getDate())}`;
+}
+// b − a en jours entiers (dates "YYYY-MM-DD")
+function daysBetween(a, b) {
+  const pa = parseDate(a), pb = parseDate(b);
+  return Math.round((Date.UTC(pb.y,pb.m,pb.d) - Date.UTC(pa.y,pa.m,pa.d)) / 86400000);
+}
+// Ce qui change en base quand tu réponds à une carte : raté → boîte 0 et retour demain ; réussi → boîte +1
+function reviewPatch(m, ok, today) {
+  const base = { last_reviewed: today, reviews: m.reviews + 1 };
+  if (!ok) return { ...base, box: 0, lapses: m.lapses + 1, next_review: addDays(today, GAPS[0]) };
+  const box = m.box + 1;
+  if (box >= MAX_BOX) return { ...base, box, mastered: true };
+  return { ...base, box, next_review: addDays(today, GAPS[box]) };
+}
+function whenLabel(dateStr, today) {
+  const d = daysBetween(today, dateStr);
+  if (d < 0) return `depuis ${-d} j`;
+  if (d === 0) return "aujourd'hui";
+  if (d === 1) return "demain";
+  return `dans ${d} j`;
+}
+
 export default function App() {
   const [subjects, setSubjects] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -408,6 +444,28 @@ export default function App() {
   const [newFolderName, setNewFolderName] = useState("");
   const [selectedFolder, setSelectedFolder] = useState(null);
 
+  // ---- Carnet d'erreurs ----
+  const [mistakes, setMistakes] = useState([]);
+  const [carnetError, setCarnetError] = useState(false);  // table `mistakes` introuvable / inaccessible
+  const [carnetTab, setCarnetTab] = useState("today");    // today | add | list
+  const [revealed, setRevealed] = useState(false);         // correction affichée ?
+  const [sessionRaw, setSession] = useState({ ok:0, ko:0, day:"" }); // bilan de la séance (repart à zéro chaque jour)
+  const [mDraft, setMDraft] = useState(EMPTY_MISTAKE);     // formulaire d'ajout / de modification
+  const [mEditId, setMEditId] = useState(null);            // id de l'erreur en cours de modification
+  const [mToast, setMToast] = useState("");
+  const [mFilter, setMFilter] = useState("all");           // "all" | "none" | id de matière
+  const [showMastered, setShowMastered] = useState(false);
+  const [openMistake, setOpenMistake] = useState(null);    // carte dépliée dans la liste
+  const toastTimer = useRef(null);
+
+  // ---- Carnet d'erreurs : chargement séparé, pour qu'une table manquante ne casse pas le reste du site ----
+  async function loadMistakes() {
+    const { data, error } = await supabase.from('mistakes').select('*').order('id');
+    if (error) { console.error('mistakes:', error); setCarnetError(true); return; }
+    setCarnetError(false);
+    setMistakes(data || []);
+  }
+
   // ---- Chargement initial depuis Supabase ----
   async function fetchAll() {
     setLoadError(false);
@@ -437,6 +495,8 @@ export default function App() {
         setTarget(t);
         setTargetDraft(String(t));
       }
+
+      await loadMistakes();
     } catch (err) {
       console.error('fetchAll:', err);
       failed = true;
@@ -536,6 +596,7 @@ export default function App() {
     const pend = pendingSub.current[id];
     if (pend) { clearTimeout(pend.timer); delete pendingSub.current[id]; }
     setSubjects(p => p.filter(x => x.id !== id));
+    setMistakes(p => p.map(m => m.subject_id === id ? {...m, subject_id:null} : m)); // en base : "on delete set null"
     setSelectedId(null);
     const { error } = await supabase.from('subjects').delete().eq('id', id);
     if (error) console.error('deleteSubject:', error);
@@ -627,6 +688,93 @@ export default function App() {
     if (error) console.error('deleteFile:', error);
   }
 
+  // ---- Carnet d'erreurs ----
+  function showToast(msg) {
+    setMToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(()=>setMToast(""), 2600);
+  }
+
+  // Ajout d'une erreur, ou enregistrement des modifications si mEditId est défini
+  async function submitMistake() {
+    const question = mDraft.question.trim();
+    if (!question) return;
+    const base = {
+      subject_id: mDraft.subject_id === "" ? null : Number(mDraft.subject_id),
+      chapter: mDraft.chapter.trim(),
+      question,
+      pitfall: mDraft.pitfall.trim(),
+      answer: mDraft.answer.trim(),
+    };
+    // on garde matière + chapitre : on ajoute souvent plusieurs erreurs d'un même DS à la suite
+    const keepContext = { ...EMPTY_MISTAKE, subject_id: mDraft.subject_id, chapter: mDraft.chapter };
+
+    if (mEditId !== null) {
+      const { error } = await supabase.from('mistakes').update(base).eq('id', mEditId);
+      if (error) { console.error('updateMistake:', error); showToast("⚠️ Modification non enregistrée (voir la console)"); return; }
+      setMistakes(p => p.map(m => m.id === mEditId ? {...m, ...base} : m));
+      setMEditId(null);
+      setMDraft(EMPTY_MISTAKE);
+      setCarnetTab("list");
+      showToast("✏️ Modifications enregistrées");
+      return;
+    }
+
+    const t = todayLocal();
+    const { data, error } = await supabase.from('mistakes')
+      .insert({ ...base, box:0, next_review: mDraft.now ? t : addDays(t, GAPS[0]) })
+      .select().single();
+    if (error) { console.error('addMistake:', error); showToast("⚠️ Ajout impossible (voir la console)"); return; }
+    setMistakes(p => [...p, data]);
+    setMDraft(keepContext);
+    showToast(mDraft.now ? "✅ Ajoutée — à revoir tout de suite" : "✅ Ajoutée — 1re révision demain");
+  }
+
+  function startEditMistake(m) {
+    setMEditId(m.id);
+    setMDraft({
+      subject_id: m.subject_id == null ? "" : String(m.subject_id),
+      chapter: m.chapter || "", question: m.question || "",
+      pitfall: m.pitfall || "", answer: m.answer || "", now:false,
+    });
+    setCarnetTab("add");
+  }
+
+  function cancelEditMistake() {
+    setMEditId(null);
+    setMDraft(EMPTY_MISTAKE);
+    setCarnetTab("list");
+  }
+
+  // Réponse à une carte : ok = réussi / !ok = raté
+  async function answerMistake(m, ok) {
+    const t = todayLocal();
+    const patch = reviewPatch(m, ok, t);
+    setMistakes(p => p.map(x => x.id === m.id ? {...x, ...patch} : x));
+    setRevealed(false);
+    setSession(s => {
+      const cur = s.day === t ? s : { ok:0, ko:0 }; // nouveau jour → nouveau bilan
+      return { ok: cur.ok + (ok?1:0), ko: cur.ko + (ok?0:1), day: t };
+    });
+    const { error } = await supabase.from('mistakes').update(patch).eq('id', m.id);
+    if (error) console.error('answerMistake:', error);
+  }
+
+  async function reactivateMistake(m) {
+    const patch = { box:0, mastered:false, next_review: addDays(todayLocal(), GAPS[0]) };
+    setMistakes(p => p.map(x => x.id === m.id ? {...x, ...patch} : x));
+    const { error } = await supabase.from('mistakes').update(patch).eq('id', m.id);
+    if (error) console.error('reactivateMistake:', error);
+  }
+
+  async function deleteMistake(id) {
+    if (!window.confirm("Supprimer cette erreur du carnet ?")) return;
+    setMistakes(p => p.filter(m => m.id !== id));
+    if (mEditId === id) { setMEditId(null); setMDraft(EMPTY_MISTAKE); }
+    const { error } = await supabase.from('mistakes').delete().eq('id', id);
+    if (error) console.error('deleteMistake:', error);
+  }
+
   const evoData = useMemo(()=>{
     if(evoSubject==="global") return buildEvolutionData(subjects, granularity);
     const sub = subjects.find(s=>s.id===parseInt(evoSubject));
@@ -659,8 +807,17 @@ export default function App() {
   const isNewBadge = b => seenRef.current !== null && b.level > (seenRef.current[b.id] ?? 0);
   const newBadgeCount = badgeData.badges.filter(isNewBadge).length;
 
-  const TABS=[["dashboard","📊"],["subjects","📚"],["plan","🎯"],["evolution","📈"],["badges","🏅"],["perso","📁"]];
-  const TAB_LABELS={"dashboard":"Dashboard","subjects":"Matières","plan":"Plan","evolution":"Évolution","badges":"Badges","perso":"Perso"};
+  // ---- Carnet : ce qui est à revoir aujourd'hui (les plus en retard d'abord, puis les moins bien sues) ----
+  const today = todayLocal();
+  const dues = useMemo(()=>mistakes
+    .filter(m=>!m.mastered && m.next_review<=today)
+    .sort((a,b)=>a.next_review.localeCompare(b.next_review) || a.box-b.box || a.id-b.id), [mistakes, today]);
+  const activeMistakes = mistakes.filter(m=>!m.mastered);
+  const nextDue = activeMistakes.filter(m=>m.next_review>today).map(m=>m.next_review).sort()[0] || null;
+  const session = sessionRaw.day === today ? sessionRaw : { ok:0, ko:0 }; // le bilan d'hier ne s'affiche plus
+
+  const TABS=[["dashboard","📊"],["carnet","🧠"],["subjects","📚"],["plan","🎯"],["evolution","📈"],["badges","🏅"],["perso","📁"]];
+  const TAB_LABELS={"dashboard":"Dashboard","carnet":"Carnet","subjects":"Matières","plan":"Plan","evolution":"Évolution","badges":"Badges","perso":"Perso"};
 
   if (loading) {
     return (
@@ -714,25 +871,29 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{display:"flex",borderBottom:`1px solid ${S.border}`,background:S.bg,position:"sticky",top:0,zIndex:100}}>
-        {TABS.map(([t,icon])=>(
-          <button key={t} onClick={()=>setTab(t)} style={{
-            flex:1,padding:"11px 2px",background:"none",border:"none",
-            borderBottom:tab===t?`2px solid ${S.accent}`:"2px solid transparent",
-            color:tab===t?S.accent:S.muted,fontSize:11,cursor:"pointer",
-            fontFamily:"Syne,sans-serif",fontWeight:700,letterSpacing:1,transition:"all 0.2s",
-            display:"flex",flexDirection:"column",alignItems:"center",gap:2
-          }}>
-            <span style={{fontSize:16,position:"relative"}}>
-              {icon}
-              {t==="badges"&&newBadgeCount>0&&(
-                <span style={{position:"absolute",top:-3,right:-7,minWidth:12,height:12,borderRadius:6,background:"#F472B6",color:"#fff",fontSize:8,
-                  fontFamily:"Syne,sans-serif",fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px"}}>{newBadgeCount}</span>
-              )}
-            </span>
-            <span>{TAB_LABELS[t]}</span>
-          </button>
-        ))}
+      <div style={{display:"flex",overflowX:"auto",borderBottom:`1px solid ${S.border}`,background:S.bg,position:"sticky",top:0,zIndex:100}}>
+        {TABS.map(([t,icon])=>{
+          // pastille : nouveaux badges / erreurs à revoir aujourd'hui
+          const bubble = t==="badges" ? newBadgeCount : t==="carnet" ? dues.length : 0;
+          return (
+            <button key={t} onClick={()=>setTab(t)} style={{
+              flex:"1 0 auto",padding:"11px 4px",background:"none",border:"none",
+              borderBottom:tab===t?`2px solid ${S.accent}`:"2px solid transparent",
+              color:tab===t?S.accent:S.muted,fontSize:10,cursor:"pointer",
+              fontFamily:"Syne,sans-serif",fontWeight:700,letterSpacing:0.5,transition:"all 0.2s",
+              display:"flex",flexDirection:"column",alignItems:"center",gap:2
+            }}>
+              <span style={{fontSize:16,position:"relative"}}>
+                {icon}
+                {bubble>0&&(
+                  <span style={{position:"absolute",top:-3,right:-7,minWidth:12,height:12,borderRadius:6,background:"#F472B6",color:"#fff",fontSize:8,
+                    fontFamily:"Syne,sans-serif",fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 3px"}}>{bubble}</span>
+                )}
+              </span>
+              <span>{TAB_LABELS[t]}</span>
+            </button>
+          );
+        })}
       </div>
 
       <div style={{padding:16,paddingBottom:80}}>
@@ -753,6 +914,25 @@ export default function App() {
         {/* DASHBOARD */}
         {tab==="dashboard"&&(
           <div>
+            {mistakes.length>0&&(()=>{
+              const n = dues.length;
+              return (
+                <div onClick={()=>{setCarnetTab("today");setTab("carnet");}}
+                  style={{background:n>0?`linear-gradient(135deg,#1E1A4A 0%,${S.surface} 100%)`:S.surface,borderRadius:14,padding:14,marginBottom:16,
+                    border:`1px solid ${n>0?S.accent+"70":S.border}`,cursor:"pointer",display:"flex",alignItems:"center",gap:12}}>
+                  <div style={{fontSize:30,lineHeight:1}}>🧠</div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:10,color:S.muted,letterSpacing:3,fontFamily:"Syne,sans-serif"}}>CARNET D'ERREURS</div>
+                    <div style={{fontFamily:"Syne,sans-serif",fontWeight:700,fontSize:14,marginTop:3}}>
+                      {n>0?`${n} erreur${n>1?"s":""} à revoir aujourd'hui`:"Tout est à jour 🎉"}
+                    </div>
+                    {n===0&&nextDue&&<div style={{fontSize:10,color:S.muted,marginTop:2}}>Prochaine révision {whenLabel(nextDue,today)}</div>}
+                  </div>
+                  {n>0&&<span style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:12,color:"#fff",background:S.accent,borderRadius:8,padding:"6px 10px",flexShrink:0}}>Réviser →</span>}
+                </div>
+              );
+            })()}
+
             {subjects.length>0&&(()=>{
               const ranking = buildLossRanking(subjects);
               return (
@@ -872,6 +1052,314 @@ export default function App() {
             })}
           </div>
         )}
+
+        {/* CARNET D'ERREURS */}
+        {tab==="carnet"&&(()=>{
+          const label = {fontSize:10,color:S.muted,letterSpacing:3,marginBottom:10,fontFamily:"Syne,sans-serif"};
+          // (le site hérite de text-align:center via index.css : on aligne à gauche les textes longs du carnet)
+          const fieldLabel = {fontSize:9,color:S.muted,letterSpacing:2,margin:"12px 0 6px",fontFamily:"Syne,sans-serif",fontWeight:700,textAlign:"left"};
+          const area = {...inp(),width:"100%",resize:"vertical",lineHeight:1.5};
+          const bigBtn = {width:"100%",borderRadius:10,padding:"12px",fontSize:13,cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:700};
+          const cur = dues[0] || null;
+          const curSubj = cur ? subjects.find(s=>s.id===cur.subject_id) : null;
+
+          const subjChip = m => {
+            const s = subjects.find(x=>x.id===m.subject_id);
+            const c = s ? s.color : S.muted;
+            return <span style={{fontSize:10,fontFamily:"Syne,sans-serif",fontWeight:700,color:c,background:c+"20",border:`1px solid ${c}50`,borderRadius:6,padding:"2px 8px"}}>{s?s.name:"Sans matière"}</span>;
+          };
+          const dots = m => (
+            <div style={{display:"flex",gap:4}} title={`${m.box}/${MAX_BOX} réussites d'affilée`}>
+              {Array.from({length:MAX_BOX}).map((_,j)=>(
+                <span key={j} style={{width:8,height:8,borderRadius:4,background:j<m.box?"#34D399":S.surface2,border:`1px solid ${j<m.box?"#34D399":S.border}`}} />
+              ))}
+            </div>
+          );
+          const pitfallBlock = txt => (
+            <div style={{background:"#F8717112",border:"1px solid #F8717140",borderRadius:10,padding:12,marginBottom:10,textAlign:"left"}}>
+              <div style={{fontSize:9,color:"#F87171",letterSpacing:2,fontFamily:"Syne,sans-serif",fontWeight:700,marginBottom:4}}>🪤 LE PIÈGE</div>
+              <div style={{fontSize:13,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{txt}</div>
+            </div>
+          );
+          const answerBlock = txt => (
+            <div style={{background:"#34D39912",border:"1px solid #34D39940",borderRadius:10,padding:12,marginBottom:10,textAlign:"left"}}>
+              <div style={{fontSize:9,color:"#34D399",letterSpacing:2,fontFamily:"Syne,sans-serif",fontWeight:700,marginBottom:4}}>✅ LA BONNE MÉTHODE</div>
+              <div style={{fontSize:13,lineHeight:1.6,whiteSpace:"pre-wrap"}}>{txt}</div>
+            </div>
+          );
+
+          // ---------- Révision du jour ----------
+          const todayView = (()=>{
+            if (cur) {
+              const late = daysBetween(cur.next_review, today);
+              const nextOk = cur.box+1>=MAX_BOX ? "maîtrisée 🏆" : `revient dans ${GAPS[cur.box+1]} j`;
+              return (
+                <div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <div style={{...label,marginBottom:0}}>RÉVISION DU JOUR</div>
+                    <div style={{fontSize:11,color:S.muted}}>
+                      {dues.length} à revoir{(session.ok+session.ko)>0?` · ${session.ok}✅ ${session.ko}❌`:""}
+                    </div>
+                  </div>
+                  <div style={{background:S.surface,borderRadius:16,padding:16,border:`1px solid ${(curSubj?curSubj.color:S.accent)}40`}}>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:12}}>
+                      {subjChip(cur)}
+                      {cur.chapter&&<span style={{fontSize:11,color:S.muted}}>{cur.chapter}</span>}
+                    </div>
+                    <div style={{fontSize:14,lineHeight:1.65,whiteSpace:"pre-wrap",textAlign:"left"}}>{cur.question}</div>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:14,fontSize:10,color:S.muted}}>
+                      {dots(cur)}
+                      <span>
+                        {late>0?`en retard de ${late} j`:"prévue aujourd'hui"}
+                        {cur.lapses>0?` · ratée ${cur.lapses}×`:""}
+                      </span>
+                    </div>
+
+                    {!revealed?(
+                      <button onClick={()=>setRevealed(true)}
+                        style={{...bigBtn,marginTop:16,background:S.surface2,border:`1px solid ${S.border}`,color:S.text}}>👀 Voir la correction</button>
+                    ):(
+                      <div style={{marginTop:16}}>
+                        {cur.pitfall&&pitfallBlock(cur.pitfall)}
+                        {cur.answer&&answerBlock(cur.answer)}
+                        {!cur.pitfall&&!cur.answer&&(
+                          <div style={{fontSize:12,color:S.muted,fontStyle:"italic",marginBottom:10,lineHeight:1.6,textAlign:"left"}}>
+                            Aucune correction enregistrée : compare avec ton cours. Tu pourras la compléter avec ✏️ dans l'onglet Carnet.
+                          </div>
+                        )}
+                        <div style={{display:"flex",gap:10,marginTop:14}}>
+                          <button onClick={()=>answerMistake(cur,false)}
+                            style={{...bigBtn,flex:1,width:"auto",background:"#F8717120",border:"1px solid #F8717160",color:"#F87171"}}>❌ Raté</button>
+                          <button onClick={()=>answerMistake(cur,true)}
+                            style={{...bigBtn,flex:1,width:"auto",background:"#34D39920",border:"1px solid #34D39960",color:"#34D399"}}>✅ Réussi</button>
+                        </div>
+                        <div style={{fontSize:10,color:S.muted,textAlign:"center",marginTop:8}}>
+                          ❌ revient demain · ✅ {nextOk}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {!revealed&&(
+                    <div style={{fontSize:11,color:S.muted,textAlign:"center",marginTop:10,lineHeight:1.6}}>
+                      Cherche d'abord sur ta feuille, <i>puis</i> regarde la correction. Sois honnête ! 😉
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            if (session.ok+session.ko>0) {
+              return (
+                <div style={{background:"linear-gradient(135deg,#1E1A4A 0%,#13131A 100%)",border:`1px solid ${S.accent}50`,borderRadius:16,padding:20,textAlign:"center"}}>
+                  <div style={{fontSize:42,lineHeight:1,marginBottom:8}}>🏁</div>
+                  <div style={{fontFamily:"Syne,sans-serif",fontWeight:800,fontSize:18}}>Séance terminée !</div>
+                  <div style={{fontSize:13,marginTop:10}}>
+                    <span style={{color:"#34D399",fontWeight:700}}>{session.ok} réussie{session.ok!==1?"s":""}</span>
+                    {" · "}
+                    <span style={{color:"#F87171",fontWeight:700}}>{session.ko} ratée{session.ko!==1?"s":""}</span>
+                  </div>
+                  <div style={{fontSize:11,color:S.muted,marginTop:8,lineHeight:1.6}}>
+                    {session.ko>0?"Les ratées reviennent demain, c'est exactement le but : c'est là que tu progresses. ":""}
+                    {nextDue?`Prochaine révision ${whenLabel(nextDue,today)}.`:"Plus rien en attente."}
+                  </div>
+                  <button onClick={()=>setSession({ok:0,ko:0})}
+                    style={{...bigBtn,marginTop:14,width:"auto",padding:"8px 18px",background:S.accent,border:"none",color:"#fff"}}>OK</button>
+                </div>
+              );
+            }
+            if (activeMistakes.length===0) {
+              return (
+                <div style={{textAlign:"center",padding:"30px 16px",color:S.muted}}>
+                  <div style={{fontSize:42,marginBottom:10}}>🧠</div>
+                  <div style={{fontFamily:"Syne,sans-serif",fontSize:14,color:S.text,fontWeight:700}}>Ton carnet est vide</div>
+                  <div style={{fontSize:12,marginTop:8,lineHeight:1.7}}>
+                    Chaque exercice raté (DS, exercice, question de cours) entre ici, puis revient à J+1, J+3, J+7, J+14, J+30.<br/>
+                    Réussi → on espace. Raté → retour à demain.
+                  </div>
+                  <button onClick={()=>setCarnetTab("add")}
+                    style={{...bigBtn,marginTop:16,width:"auto",padding:"10px 20px",background:S.accent,border:"none",color:"#fff"}}>➕ Ajouter ma première erreur</button>
+                </div>
+              );
+            }
+            return (
+              <div style={{textAlign:"center",padding:"30px 16px",color:S.muted}}>
+                <div style={{fontSize:42,marginBottom:10}}>🎉</div>
+                <div style={{fontFamily:"Syne,sans-serif",fontSize:14,color:S.text,fontWeight:700}}>Rien à revoir aujourd'hui</div>
+                <div style={{fontSize:12,marginTop:8}}>
+                  {nextDue?`Prochaine révision ${whenLabel(nextDue,today)}.`:""}
+                </div>
+              </div>
+            );
+          })();
+
+          // ---------- Ajout / modification ----------
+          const addView = (
+            <div>
+              <div style={label}>{mEditId!==null?"MODIFIER L'ERREUR":"NOUVELLE ERREUR"}</div>
+              <div style={{background:S.surface,borderRadius:14,padding:14,border:`1px solid ${S.border}`}}>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                  <select value={mDraft.subject_id} onChange={e=>setMDraft(d=>({...d,subject_id:e.target.value}))}
+                    style={{...inp(),flex:"1 1 140px"}}>
+                    <option value="">Matière…</option>
+                    {subjects.map(s=><option key={s.id} value={String(s.id)}>{s.name}</option>)}
+                  </select>
+                  <input placeholder="Chapitre (ex : Suites)" value={mDraft.chapter}
+                    onChange={e=>setMDraft(d=>({...d,chapter:e.target.value}))}
+                    style={{...inp(),flex:"1 1 140px"}} />
+                </div>
+
+                <div style={fieldLabel}>ÉNONCÉ : ce que tu dois savoir refaire *</div>
+                <textarea rows={4} value={mDraft.question} placeholder="Ex : Montrer par récurrence que u_n ≤ 3 pour tout n, avec u_{n+1} = √(2u_n + 3)"
+                  onChange={e=>setMDraft(d=>({...d,question:e.target.value}))} style={area} />
+
+                <div style={fieldLabel}>🪤 POURQUOI TU L'AS RATÉE (le piège)</div>
+                <textarea rows={2} value={mDraft.pitfall} placeholder="Ex : j'ai oublié de vérifier l'initialisation / confondu ≤ et <"
+                  onChange={e=>setMDraft(d=>({...d,pitfall:e.target.value}))} style={area} />
+
+                <div style={fieldLabel}>✅ LA BONNE MÉTHODE / RÉPONSE</div>
+                <textarea rows={4} value={mDraft.answer} placeholder="La correction, ou juste les étapes clés à retenir"
+                  onChange={e=>setMDraft(d=>({...d,answer:e.target.value}))} style={area} />
+
+                {mEditId===null&&(
+                  <label style={{display:"flex",gap:8,alignItems:"center",fontSize:11,color:S.muted,marginTop:12,cursor:"pointer"}}>
+                    <input type="checkbox" checked={mDraft.now} onChange={e=>setMDraft(d=>({...d,now:e.target.checked}))} />
+                    Revoir dès aujourd'hui (sinon : demain)
+                  </label>
+                )}
+
+                <div style={{display:"flex",gap:8,marginTop:14}}>
+                  {mEditId!==null&&(
+                    <button onClick={cancelEditMistake}
+                      style={{...bigBtn,flex:1,width:"auto",background:"none",border:`1px solid ${S.border}`,color:S.muted}}>Annuler</button>
+                  )}
+                  <button onClick={submitMistake} disabled={!mDraft.question.trim()}
+                    style={{...bigBtn,flex:2,width:"auto",background:S.accent,border:"none",color:"#fff",opacity:mDraft.question.trim()?1:0.4,cursor:mDraft.question.trim()?"pointer":"default"}}>
+                    {mEditId!==null?"Enregistrer les modifications":"➕ Ajouter au carnet"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+
+          // ---------- Liste ----------
+          const chips = [["all","Toutes"],
+            ...subjects.filter(s=>mistakes.some(m=>m.subject_id===s.id)).map(s=>[String(s.id),s.name]),
+            ...(mistakes.some(m=>m.subject_id==null)?[["none","Sans matière"]]:[])];
+          const masteredCount = mistakes.length - activeMistakes.length;
+          const shown = mistakes
+            .filter(m=>(showMastered||!m.mastered) && (mFilter==="all" || (mFilter==="none" ? m.subject_id==null : String(m.subject_id)===mFilter)))
+            .sort((a,b)=>(Number(a.mastered)-Number(b.mastered)) || a.next_review.localeCompare(b.next_review) || a.id-b.id);
+          const listView = (
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,gap:8,flexWrap:"wrap"}}>
+                <div style={{...label,marginBottom:0}}>MON CARNET</div>
+                <div style={{fontSize:11,color:S.muted}}>{activeMistakes.length} en cours · {masteredCount} maîtrisée{masteredCount!==1?"s":""}</div>
+              </div>
+              {chips.length>1&&(
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
+                  {chips.map(([k,name])=>(
+                    <button key={k} onClick={()=>setMFilter(k)} style={{
+                      background:mFilter===k?S.accent:S.surface,border:`1px solid ${mFilter===k?S.accent:S.border}`,
+                      color:mFilter===k?"#fff":S.muted,borderRadius:20,padding:"5px 12px",fontSize:11,cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:600
+                    }}>{name}</button>
+                  ))}
+                </div>
+              )}
+              {masteredCount>0&&(
+                <label style={{display:"flex",gap:8,alignItems:"center",fontSize:11,color:S.muted,marginBottom:12,cursor:"pointer"}}>
+                  <input type="checkbox" checked={showMastered} onChange={e=>setShowMastered(e.target.checked)} />
+                  Afficher les maîtrisées 🏆
+                </label>
+              )}
+              {shown.length===0&&(
+                <div style={{textAlign:"center",padding:"30px 20px",color:S.muted,fontSize:12,fontStyle:"italic"}}>
+                  {mistakes.length===0?"Aucune erreur pour l'instant : ajoute la première !":"Aucune erreur dans cette sélection."}
+                </div>
+              )}
+              {shown.map(m=>{
+                const open = openMistake===m.id;
+                return (
+                  <div key={m.id} style={{background:S.surface,borderRadius:12,padding:12,marginBottom:8,border:`1px solid ${S.border}`,opacity:m.mastered?0.7:1}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                      <div style={{display:"flex",flexWrap:"wrap",gap:6,alignItems:"center",minWidth:0}}>
+                        {subjChip(m)}
+                        {m.chapter&&<span style={{fontSize:10,color:S.muted}}>{m.chapter}</span>}
+                      </div>
+                      <div style={{display:"flex",gap:12,flexShrink:0}}>
+                        <button onClick={()=>startEditMistake(m)} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:13}}>✏️</button>
+                        <button onClick={()=>deleteMistake(m.id)} style={{background:"none",border:"none",color:S.muted,cursor:"pointer",fontSize:16}}>×</button>
+                      </div>
+                    </div>
+                    <div onClick={()=>setOpenMistake(open?null:m.id)}
+                      style={{fontSize:13,lineHeight:1.55,whiteSpace:"pre-wrap",marginTop:8,cursor:"pointer",textAlign:"left",
+                        ...(open?{}:{display:"-webkit-box",WebkitLineClamp:3,WebkitBoxOrient:"vertical",overflow:"hidden"})}}>{m.question}</div>
+                    {open&&(
+                      <div style={{marginTop:10}}>
+                        {m.pitfall&&pitfallBlock(m.pitfall)}
+                        {m.answer&&answerBlock(m.answer)}
+                      </div>
+                    )}
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,fontSize:10,color:S.muted}}>
+                      {dots(m)}
+                      <span>
+                        {m.mastered?"🏆 maîtrisée":`à revoir ${whenLabel(m.next_review,today)}`}
+                        {m.lapses>0?` · ratée ${m.lapses}×`:""}
+                      </span>
+                    </div>
+                    {m.mastered&&(
+                      <button onClick={()=>reactivateMistake(m)}
+                        style={{marginTop:8,background:"none",border:`1px solid ${S.border}`,color:S.muted,borderRadius:8,padding:"5px 10px",fontSize:11,cursor:"pointer"}}>↺ Remettre en révision</button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+
+          const subTabs = [
+            ["today","🎯","Aujourd'hui"+(dues.length>0?` (${dues.length})`:"")],
+            ["add","➕",mEditId!==null?"Modifier":"Ajouter"],
+            ["list","📚","Carnet"],
+          ];
+          return (
+            <div>
+              {carnetError?(
+                <div style={{background:"#F8717118",border:"1px solid #F8717160",borderRadius:12,padding:12,fontSize:12,lineHeight:1.6}}>
+                  <div style={{fontFamily:"Syne,sans-serif",fontWeight:700,color:"#F87171",marginBottom:4}}>⚠️ Table « mistakes » introuvable</div>
+                  <div style={{color:S.muted}}>
+                    Elle n'est pas encore créée dans Supabase (ou le projet est en pause). Va dans Supabase → SQL Editor, colle le SQL du carnet d'erreurs, clique « Run », puis réessaie.
+                  </div>
+                  <button onClick={loadMistakes}
+                    style={{marginTop:8,background:S.accent,border:"none",color:"#fff",borderRadius:8,padding:"6px 14px",fontSize:12,cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:700}}>
+                    Réessayer
+                  </button>
+                </div>
+              ):(
+                <>
+                  <div style={{display:"flex",gap:8,marginBottom:16}}>
+                    {subTabs.map(([key,icon,name])=>(
+                      <button key={key} onClick={()=>setCarnetTab(key)} style={{
+                        flex:1,background:carnetTab===key?S.accent:S.surface,
+                        border:`1px solid ${carnetTab===key?S.accent:S.border}`,
+                        color:carnetTab===key?"#fff":S.muted,borderRadius:10,padding:"10px 4px",
+                        fontSize:11,cursor:"pointer",fontFamily:"Syne,sans-serif",fontWeight:700,
+                        display:"flex",flexDirection:"column",alignItems:"center",gap:4,transition:"all 0.2s"
+                      }}>
+                        <span style={{fontSize:16}}>{icon}</span>
+                        <span>{name}</span>
+                      </button>
+                    ))}
+                  </div>
+                  {mToast&&(
+                    <div style={{background:"#34D39918",border:"1px solid #34D39950",color:S.text,borderRadius:10,padding:"8px 12px",fontSize:12,marginBottom:12}}>{mToast}</div>
+                  )}
+                  {carnetTab==="today"&&todayView}
+                  {carnetTab==="add"&&addView}
+                  {carnetTab==="list"&&listView}
+                </>
+              )}
+            </div>
+          );
+        })()}
 
         {/* SUBJECTS */}
         {tab==="subjects"&&(
